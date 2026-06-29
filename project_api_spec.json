@@ -1,0 +1,4382 @@
+{
+    "project": {
+        "project_name": "University WiFi Attendance",
+        "version": "1.0.0",
+        "description": "REST API backend for a WiFi-based class attendance system. Teachers start a class session for a scheduled timetable slot; students mark themselves present by submitting the WiFi MAC address their device is currently connected to, which the server matches against the registered MAC of the classroom's access point. Admin manages the academic structure (departments, programs, courses, batches, rooms, time slots, timetables, teachers, students); HOD has read-only visibility into their own department; Teacher manages their own class sessions and students; Student marks attendance and views schedule/history.",
+        "backend_stack": {
+            "framework": "Laravel 12",
+            "language": "PHP 8.2+",
+            "database": "MySQL",
+            "auth_package": "Laravel Sanctum (personal access tokens, Bearer auth, no SPA cookie/session auth configured)",
+            "architecture": "Controller -> FormRequest (validation) -> Service (business logic) -> Eloquent Model, with Policies for ownership-based authorization, Resources for response shaping, and a custom BusinessException for domain-rule errors",
+            "orm": "Eloquent",
+            "queue": "database driver",
+            "cache": "database driver",
+            "session": "database driver (not used for API auth, only framework-level session table)"
+        },
+        "deployment": {
+            "method": "Docker container (php:8.3-cli base image) deployed via Coolify",
+            "process_manager": "php artisan serve (built-in dev server, bound to 0.0.0.0:8000) run as the container's foreground process",
+            "web_server": "none separate (no nginx/php-fpm in the current Dockerfile) — artisan serve handles HTTP directly",
+            "database_host": "external MySQL instance, connected via DB_* environment variables"
+        },
+        "authentication": {
+            "type": "Token-based (Laravel Sanctum personal access tokens)",
+            "header": "Authorization: Bearer {token}",
+            "token_issued_on": [
+                "POST /api/auth/register",
+                "POST /api/auth/login"
+            ],
+            "token_revoked_on": "POST /api/auth/logout (deletes only the current token, other devices/sessions stay logged in)",
+            "token_expiration": "none configured (sanctum.expiration = null — tokens are valid until manually revoked)",
+            "guard": "auth:sanctum middleware on every protected route group"
+        },
+        "base_url": "{APP_URL}/api  (e.g. https://your-domain.com/api — APP_URL in this project's .env is currently http://localhost for local dev)"
+    },
+    "roles": {
+        "description": "Role is a single enum column on the users table: admin | hod | teacher | student. Authorization is enforced in two layers: (1) route-level role middleware (role:admin, role:teacher, role:student, role:hod) gating entire route groups, and (2) model Policies for ownership checks within a role (e.g. a teacher may only end sessions for timetables they themselves teach).",
+        "Admin": {
+            "summary": "Full system access to the academic structure and oversight dashboard. Cannot start/end class sessions or block/unblock students directly (those are Teacher-only actions tied to timetable ownership).",
+            "permissions": [
+                "Full CRUD (create, read, update — no delete endpoints exist) on departments, programs, program_courses, batches, rooms, time_slots (create+read only), teachers, students, timetables",
+                "Creating a teacher or student via the admin endpoints atomically creates both the underlying User account and the Teacher/Student profile row",
+                "View system-wide dashboard: entity counts and recent audit log activity",
+                "Implicitly can view shared endpoints: GET /sessions, GET /sessions/{id}, GET /notifications, mark/delete own notifications"
+            ],
+            "cannot": [
+                "start/end class sessions",
+                "block/unblock students",
+                "mark attendance",
+                "view HOD/teacher/student dashboards (role-gated)"
+            ]
+        },
+        "HOD": {
+            "summary": "Head of Department — view-only oversight of their own department. An HOD user always has an underlying Teacher profile (per the Teacher model's is_hod accessor), and is the teacher referenced by departments.hod_teacher_id.",
+            "permissions": [
+                "GET /api/dashboard/hod — own department summary: teacher count, student count, today's session count, today's attendance percentage",
+                "Shared endpoints: GET /sessions (scoped to sessions whose timetable's batch->program belongs to the HOD's department), GET /sessions/{id}, GET /notifications, mark-read/delete own notifications"
+            ],
+            "cannot": [
+                "start/end sessions, block/unblock students, mark attendance",
+                "access any Admin CRUD endpoint (role:admin middleware blocks it)",
+                "Note: the spec's intent of HOD viewing teachers/students/attendance-report lists in detail is NOT implemented as separate endpoints in this codebase today — only the dashboard summary and the shared session/notification list exist for this role. There is no GET /api/departments/{id}/teachers or similar HOD-scoped listing endpoint."
+            ]
+        },
+        "Teacher": {
+            "summary": "Manages their own scheduled classes only — ownership is enforced via timetables.teacher_id matching the authenticated user's teacher record.",
+            "permissions": [
+                "POST /api/sessions/{timetable}/start — only for timetables they teach (TimetablePolicy::start)",
+                "POST /api/sessions/{session}/end — only for sessions belonging to their own timetable (ClassSessionPolicy::end)",
+                "GET /api/sessions/{session}/attendance — session summary, same ownership check (ClassSessionPolicy::view)",
+                "POST /api/students/{student}/block and /unblock — only for students in a batch they teach (StudentPolicy::block/unblock, checked via timetables.teacher_id + batch_id)",
+                "GET /api/attendance/report — filtered to their own taught courses/batches only",
+                "GET /api/dashboard/teacher — today's classes and sessions-started count",
+                "Shared endpoints: GET /sessions (scoped to own timetables), GET /sessions/{id}, GET /notifications, mark-read/delete own notifications"
+            ],
+            "cannot": [
+                "access Admin CRUD endpoints",
+                "start/end or view sessions/students outside their own timetables (403 via Policy)",
+                "mark attendance (student-only)"
+            ]
+        },
+        "Student": {
+            "summary": "Marks their own attendance and views their own schedule/history — scoped via students.user_id = authenticated user and students.batch_id.",
+            "permissions": [
+                "POST /api/attendance/mark — submits session_id + wifi_mac; server matches against the session's classroom WiFi MAC",
+                "GET /api/students/today-classes — today's timetable entries for their batch plus session/attendance status",
+                "GET /api/students/schedule — full weekly timetable for their batch, grouped by day",
+                "GET /api/students/attendance-history — paginated list of their own attendance records",
+                "GET /api/dashboard/student — today's class count and overall attendance percentage",
+                "Shared endpoints: GET /sessions (scoped to own batch), GET /sessions/{id}, GET /notifications, mark-read/delete own notifications"
+            ],
+            "cannot": [
+                "mark attendance if is_blocked = true (403)",
+                "mark attendance for a session outside their own batch (403)",
+                "mark attendance twice for the same session (409)",
+                "access any Admin/Teacher/HOD endpoint"
+            ]
+        }
+    },
+    "database": {
+        "note": "Standard Laravel framework tables also exist (password_reset_tokens, sessions, cache, cache_locks, jobs, job_batches, failed_jobs) but carry no application-specific logic and are omitted below for brevity.",
+        "tables": [
+            {
+                "table_name": "users",
+                "description": "Single table for all 4 roles. Role is an enum column; the actual profile detail (teacher/student specific fields) lives in the teachers/students tables, linked by user_id.",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "name",
+                        "type": "string",
+                        "nullable": false
+                    },
+                    {
+                        "name": "email",
+                        "type": "string",
+                        "nullable": false,
+                        "unique": true
+                    },
+                    {
+                        "name": "email_verified_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "password",
+                        "type": "string (hashed cast)",
+                        "nullable": false
+                    },
+                    {
+                        "name": "role",
+                        "type": "enum(admin,hod,teacher,student)",
+                        "nullable": false,
+                        "default": "student"
+                    },
+                    {
+                        "name": "status",
+                        "type": "enum(active,inactive)",
+                        "nullable": false,
+                        "default": "active"
+                    },
+                    {
+                        "name": "remember_token",
+                        "type": "string",
+                        "nullable": true
+                    },
+                    {
+                        "name": "created_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "updated_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    }
+                ],
+                "primary_key": "id",
+                "foreign_keys": [],
+                "indexes": [
+                    "email (unique)",
+                    "role",
+                    "status",
+                    "created_at"
+                ],
+                "relationships": [
+                    "hasOne Teacher",
+                    "hasOne Student",
+                    "hasMany Notification",
+                    "hasMany AuditLog",
+                    "hasMany PersonalAccessToken (Sanctum, morphMany)"
+                ]
+            },
+            {
+                "table_name": "departments",
+                "description": "Academic department. hod_teacher_id points at the teacher who heads it (nullable, since a department can exist before an HOD is assigned).",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "name",
+                        "type": "string",
+                        "nullable": false,
+                        "unique": true
+                    },
+                    {
+                        "name": "hod_teacher_id",
+                        "type": "bigint unsigned",
+                        "nullable": true
+                    },
+                    {
+                        "name": "created_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "updated_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    }
+                ],
+                "primary_key": "id",
+                "foreign_keys": [
+                    {
+                        "column": "hod_teacher_id",
+                        "references": "teachers.id",
+                        "on_delete": "set null"
+                    }
+                ],
+                "indexes": [
+                    "name (unique)",
+                    "hod_teacher_id",
+                    "created_at"
+                ],
+                "relationships": [
+                    "belongsTo Teacher as hod",
+                    "hasMany Teacher",
+                    "hasMany Student",
+                    "hasMany Program"
+                ]
+            },
+            {
+                "table_name": "teachers",
+                "description": "Profile row for any user with role=teacher OR role=hod (HOD always has a teacher profile too).",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "user_id",
+                        "type": "bigint unsigned",
+                        "nullable": false,
+                        "unique": true
+                    },
+                    {
+                        "name": "department_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "employee_no",
+                        "type": "string(50)",
+                        "nullable": false,
+                        "unique": true
+                    },
+                    {
+                        "name": "designation",
+                        "type": "string(100)",
+                        "nullable": false
+                    },
+                    {
+                        "name": "phone",
+                        "type": "string(20)",
+                        "nullable": true
+                    },
+                    {
+                        "name": "created_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "updated_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    }
+                ],
+                "primary_key": "id",
+                "foreign_keys": [
+                    {
+                        "column": "user_id",
+                        "references": "users.id",
+                        "on_delete": "cascade"
+                    },
+                    {
+                        "column": "department_id",
+                        "references": "departments.id",
+                        "on_delete": "cascade"
+                    }
+                ],
+                "indexes": [
+                    "user_id (unique)",
+                    "employee_no (unique)",
+                    "created_at"
+                ],
+                "relationships": [
+                    "belongsTo User",
+                    "belongsTo Department",
+                    "hasMany Timetable",
+                    "computed is_hod accessor (Department::where('hod_teacher_id', id)->exists())"
+                ]
+            },
+            {
+                "table_name": "programs",
+                "description": "Degree program offered by a department, e.g. BS Computer Science.",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "department_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "name",
+                        "type": "string(100)",
+                        "nullable": false
+                    },
+                    {
+                        "name": "code",
+                        "type": "string(20)",
+                        "nullable": false,
+                        "unique": true
+                    },
+                    {
+                        "name": "created_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "updated_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    }
+                ],
+                "primary_key": "id",
+                "foreign_keys": [
+                    {
+                        "column": "department_id",
+                        "references": "departments.id",
+                        "on_delete": "cascade"
+                    }
+                ],
+                "indexes": [
+                    "code (unique)",
+                    "created_at"
+                ],
+                "relationships": [
+                    "belongsTo Department",
+                    "hasMany ProgramCourse",
+                    "hasMany Batch"
+                ]
+            },
+            {
+                "table_name": "program_courses",
+                "description": "A course offered within a program, e.g. CS101 Introduction to Programming.",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "program_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "course_code",
+                        "type": "string(20)",
+                        "nullable": false
+                    },
+                    {
+                        "name": "course_title",
+                        "type": "string(255)",
+                        "nullable": false
+                    },
+                    {
+                        "name": "credit_hours",
+                        "type": "tinyint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "created_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "updated_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    }
+                ],
+                "primary_key": "id",
+                "foreign_keys": [
+                    {
+                        "column": "program_id",
+                        "references": "programs.id",
+                        "on_delete": "cascade"
+                    }
+                ],
+                "indexes": [
+                    "course_code",
+                    "created_at"
+                ],
+                "relationships": [
+                    "belongsTo Program",
+                    "hasMany Timetable"
+                ]
+            },
+            {
+                "table_name": "batches",
+                "description": "A cohort of students within a program, e.g. BSCS-2023-M (Morning shift).",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "program_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "batch_name",
+                        "type": "string(50)",
+                        "nullable": false
+                    },
+                    {
+                        "name": "start_year",
+                        "type": "smallint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "end_year",
+                        "type": "smallint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "semester",
+                        "type": "tinyint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "shift",
+                        "type": "enum(Morning,Evening)",
+                        "nullable": false
+                    },
+                    {
+                        "name": "created_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "updated_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    }
+                ],
+                "primary_key": "id",
+                "foreign_keys": [
+                    {
+                        "column": "program_id",
+                        "references": "programs.id",
+                        "on_delete": "cascade"
+                    }
+                ],
+                "indexes": [
+                    "batch_name",
+                    "created_at"
+                ],
+                "relationships": [
+                    "belongsTo Program",
+                    "hasMany Student",
+                    "hasMany Timetable"
+                ]
+            },
+            {
+                "table_name": "students",
+                "description": "Profile row for any user with role=student. Tracks block status used to prevent attendance marking.",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "user_id",
+                        "type": "bigint unsigned",
+                        "nullable": false,
+                        "unique": true
+                    },
+                    {
+                        "name": "registration_no",
+                        "type": "string(50)",
+                        "nullable": false,
+                        "unique": true
+                    },
+                    {
+                        "name": "department_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "batch_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "phone",
+                        "type": "string(20)",
+                        "nullable": true
+                    },
+                    {
+                        "name": "is_blocked",
+                        "type": "boolean",
+                        "nullable": false,
+                        "default": false
+                    },
+                    {
+                        "name": "blocked_by_user_id",
+                        "type": "bigint unsigned",
+                        "nullable": true
+                    },
+                    {
+                        "name": "blocked_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "created_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "updated_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    }
+                ],
+                "primary_key": "id",
+                "foreign_keys": [
+                    {
+                        "column": "user_id",
+                        "references": "users.id",
+                        "on_delete": "cascade"
+                    },
+                    {
+                        "column": "department_id",
+                        "references": "departments.id",
+                        "on_delete": "cascade"
+                    },
+                    {
+                        "column": "batch_id",
+                        "references": "batches.id",
+                        "on_delete": "cascade"
+                    },
+                    {
+                        "column": "blocked_by_user_id",
+                        "references": "users.id",
+                        "on_delete": "set null"
+                    }
+                ],
+                "indexes": [
+                    "user_id (unique)",
+                    "registration_no (unique)",
+                    "is_blocked",
+                    "created_at"
+                ],
+                "relationships": [
+                    "belongsTo User",
+                    "belongsTo Department",
+                    "belongsTo Batch",
+                    "belongsTo User as blockedBy",
+                    "hasMany Attendance",
+                    "computed attendance_percentage accessor"
+                ]
+            },
+            {
+                "table_name": "rooms",
+                "description": "A physical classroom with a registered WiFi access point used as the attendance-verification signal.",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "room_no",
+                        "type": "string(50)",
+                        "nullable": false,
+                        "unique": true
+                    },
+                    {
+                        "name": "wifi_name",
+                        "type": "string(100)",
+                        "nullable": false
+                    },
+                    {
+                        "name": "wifi_mac",
+                        "type": "string(17)",
+                        "nullable": false,
+                        "unique": true,
+                        "format": "XX:XX:XX:XX:XX:XX, stored uppercase"
+                    },
+                    {
+                        "name": "created_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "updated_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    }
+                ],
+                "primary_key": "id",
+                "foreign_keys": [],
+                "indexes": [
+                    "room_no (unique)",
+                    "wifi_mac (unique)",
+                    "created_at"
+                ],
+                "relationships": [
+                    "hasMany Timetable"
+                ]
+            },
+            {
+                "table_name": "time_slots",
+                "description": "A reusable daily time window, e.g. 08:00-09:00, referenced by multiple timetable entries across different days.",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "start_time",
+                        "type": "time",
+                        "nullable": false
+                    },
+                    {
+                        "name": "end_time",
+                        "type": "time",
+                        "nullable": false
+                    },
+                    {
+                        "name": "created_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "updated_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    }
+                ],
+                "primary_key": "id",
+                "foreign_keys": [],
+                "indexes": [
+                    "start_time",
+                    "created_at"
+                ],
+                "relationships": [
+                    "hasMany Timetable (via slot_id)"
+                ]
+            },
+            {
+                "table_name": "timetables",
+                "description": "The recurring weekly schedule blueprint: which batch has which course, with which teacher, in which room, on which day/slot. class_sessions are dated instances of a timetable row.",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "batch_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "program_course_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "teacher_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "room_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "day",
+                        "type": "enum(Monday,Tuesday,Wednesday,Thursday,Friday,Saturday)",
+                        "nullable": false
+                    },
+                    {
+                        "name": "slot_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "created_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "updated_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    }
+                ],
+                "primary_key": "id",
+                "foreign_keys": [
+                    {
+                        "column": "batch_id",
+                        "references": "batches.id",
+                        "on_delete": "cascade"
+                    },
+                    {
+                        "column": "program_course_id",
+                        "references": "program_courses.id",
+                        "on_delete": "cascade"
+                    },
+                    {
+                        "column": "teacher_id",
+                        "references": "teachers.id",
+                        "on_delete": "cascade"
+                    },
+                    {
+                        "column": "room_id",
+                        "references": "rooms.id",
+                        "on_delete": "cascade"
+                    },
+                    {
+                        "column": "slot_id",
+                        "references": "time_slots.id",
+                        "on_delete": "cascade"
+                    }
+                ],
+                "indexes": [
+                    "day",
+                    "created_at"
+                ],
+                "relationships": [
+                    "belongsTo Batch",
+                    "belongsTo ProgramCourse as course",
+                    "belongsTo Teacher",
+                    "belongsTo Room",
+                    "belongsTo TimeSlot",
+                    "hasMany ClassSession",
+                    "application-level uniqueness rule (TimetableService::ensureNoConflict, not a DB constraint): no two rows may share the same day+slot_id while also sharing the same teacher_id, room_id, or batch_id"
+                ]
+            },
+            {
+                "table_name": "class_sessions",
+                "description": "A dated instance of a timetable entry — created when a teacher starts a session. Named class_sessions (model ClassSession) specifically to avoid colliding with Laravel's own session-storage table.",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "timetable_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "session_date",
+                        "type": "date",
+                        "nullable": false
+                    },
+                    {
+                        "name": "start_time",
+                        "type": "time",
+                        "nullable": false
+                    },
+                    {
+                        "name": "end_time",
+                        "type": "time",
+                        "nullable": false
+                    },
+                    {
+                        "name": "status",
+                        "type": "enum(active,ended)",
+                        "nullable": false,
+                        "default": "active"
+                    },
+                    {
+                        "name": "created_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "updated_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    }
+                ],
+                "primary_key": "id",
+                "foreign_keys": [
+                    {
+                        "column": "timetable_id",
+                        "references": "timetables.id",
+                        "on_delete": "cascade"
+                    }
+                ],
+                "indexes": [
+                    "session_date",
+                    "status",
+                    "created_at"
+                ],
+                "relationships": [
+                    "belongsTo Timetable",
+                    "hasMany Attendance (via session_id)"
+                ]
+            },
+            {
+                "table_name": "attendance",
+                "description": "One row per (session, student) pair, pre-created as 'absent' for every batch student the moment a session starts, then flipped to 'present' when the student successfully marks. Table is singular 'attendance' (model Attendance), not 'attendances'.",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "session_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "student_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "wifi_mac_detected",
+                        "type": "string(17)",
+                        "nullable": true
+                    },
+                    {
+                        "name": "status",
+                        "type": "enum(present,absent)",
+                        "nullable": false,
+                        "default": "absent"
+                    },
+                    {
+                        "name": "marked_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "created_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "updated_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    }
+                ],
+                "primary_key": "id",
+                "foreign_keys": [
+                    {
+                        "column": "session_id",
+                        "references": "class_sessions.id",
+                        "on_delete": "cascade"
+                    },
+                    {
+                        "column": "student_id",
+                        "references": "students.id",
+                        "on_delete": "cascade"
+                    }
+                ],
+                "indexes": [
+                    "unique(session_id, student_id)",
+                    "status",
+                    "created_at"
+                ],
+                "relationships": [
+                    "belongsTo ClassSession as session",
+                    "belongsTo Student"
+                ]
+            },
+            {
+                "table_name": "notifications",
+                "description": "Plain custom notification table (NOT Laravel's polymorphic database-notifications system). Created directly by NotificationService for the 6 application notification flows.",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "user_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "title",
+                        "type": "string(255)",
+                        "nullable": false
+                    },
+                    {
+                        "name": "message",
+                        "type": "text",
+                        "nullable": false
+                    },
+                    {
+                        "name": "type",
+                        "type": "enum(attendance_started,attendance_marked,session_ended,student_blocked,student_unblocked)",
+                        "nullable": false
+                    },
+                    {
+                        "name": "related_data",
+                        "type": "json",
+                        "nullable": true
+                    },
+                    {
+                        "name": "is_read",
+                        "type": "boolean",
+                        "nullable": false,
+                        "default": false
+                    },
+                    {
+                        "name": "created_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "updated_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    }
+                ],
+                "primary_key": "id",
+                "foreign_keys": [
+                    {
+                        "column": "user_id",
+                        "references": "users.id",
+                        "on_delete": "cascade"
+                    }
+                ],
+                "indexes": [
+                    "type",
+                    "is_read",
+                    "created_at"
+                ],
+                "relationships": [
+                    "belongsTo User"
+                ]
+            },
+            {
+                "table_name": "audit_logs",
+                "description": "Immutable action log (no updated_at). Written by AuditLogService for session start/end, attendance marking, and student block/unblock.",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "user_id",
+                        "type": "bigint unsigned",
+                        "nullable": true
+                    },
+                    {
+                        "name": "action",
+                        "type": "string(100)",
+                        "nullable": false
+                    },
+                    {
+                        "name": "description",
+                        "type": "text",
+                        "nullable": false
+                    },
+                    {
+                        "name": "model_type",
+                        "type": "string(100)",
+                        "nullable": true
+                    },
+                    {
+                        "name": "model_id",
+                        "type": "bigint unsigned",
+                        "nullable": true
+                    },
+                    {
+                        "name": "old_values",
+                        "type": "json",
+                        "nullable": true
+                    },
+                    {
+                        "name": "new_values",
+                        "type": "json",
+                        "nullable": true
+                    },
+                    {
+                        "name": "ip_address",
+                        "type": "string(45)",
+                        "nullable": true
+                    },
+                    {
+                        "name": "user_agent",
+                        "type": "string",
+                        "nullable": true
+                    },
+                    {
+                        "name": "created_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    }
+                ],
+                "primary_key": "id",
+                "foreign_keys": [
+                    {
+                        "column": "user_id",
+                        "references": "users.id",
+                        "on_delete": "set null"
+                    }
+                ],
+                "indexes": [
+                    "action",
+                    "model_type",
+                    "model_id",
+                    "created_at"
+                ],
+                "relationships": [
+                    "belongsTo User"
+                ]
+            },
+            {
+                "table_name": "personal_access_tokens",
+                "description": "Standard Laravel Sanctum table storing hashed API tokens, one row per issued token (per device/login).",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "tokenable_type",
+                        "type": "string",
+                        "nullable": false
+                    },
+                    {
+                        "name": "tokenable_id",
+                        "type": "bigint unsigned",
+                        "nullable": false
+                    },
+                    {
+                        "name": "name",
+                        "type": "string",
+                        "nullable": false
+                    },
+                    {
+                        "name": "token",
+                        "type": "string(64)",
+                        "nullable": false,
+                        "unique": true
+                    },
+                    {
+                        "name": "abilities",
+                        "type": "text",
+                        "nullable": true
+                    },
+                    {
+                        "name": "last_used_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "expires_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "created_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    },
+                    {
+                        "name": "updated_at",
+                        "type": "timestamp",
+                        "nullable": true
+                    }
+                ],
+                "primary_key": "id",
+                "foreign_keys": [],
+                "indexes": [
+                    "token (unique)",
+                    "tokenable_type, tokenable_id (morph index)"
+                ],
+                "relationships": [
+                    "morphTo tokenable (User)"
+                ]
+            }
+        ]
+    },
+    "models": [
+        {
+            "name": "User",
+            "table": "users",
+            "fillable": [
+                "name",
+                "email",
+                "password",
+                "role",
+                "status"
+            ],
+            "casts": {
+                "email_verified_at": "datetime",
+                "password": "hashed"
+            },
+            "hidden": [
+                "password",
+                "remember_token"
+            ],
+            "relationships": {
+                "teacher": "hasOne Teacher",
+                "student": "hasOne Student",
+                "notifications": "hasMany Notification (latest first)",
+                "auditLogs": "hasMany AuditLog"
+            },
+            "methods": [
+                "isAdmin()",
+                "isHod()",
+                "isTeacher()",
+                "isStudent()"
+            ],
+            "traits": [
+                "HasApiTokens (Sanctum)",
+                "HasFactory",
+                "Notifiable"
+            ]
+        },
+        {
+            "name": "Department",
+            "table": "departments",
+            "fillable": [
+                "name",
+                "hod_teacher_id"
+            ],
+            "casts": {},
+            "relationships": {
+                "hod": "belongsTo Teacher (via hod_teacher_id)",
+                "teachers": "hasMany Teacher",
+                "students": "hasMany Student",
+                "programs": "hasMany Program"
+            }
+        },
+        {
+            "name": "Teacher",
+            "table": "teachers",
+            "fillable": [
+                "user_id",
+                "department_id",
+                "employee_no",
+                "designation",
+                "phone"
+            ],
+            "casts": {},
+            "relationships": {
+                "user": "belongsTo User",
+                "department": "belongsTo Department",
+                "timetables": "hasMany Timetable"
+            },
+            "accessors": [
+                "is_hod: bool — Department::where('hod_teacher_id', $this->id)->exists()"
+            ]
+        },
+        {
+            "name": "Program",
+            "table": "programs",
+            "fillable": [
+                "department_id",
+                "name",
+                "code"
+            ],
+            "casts": {},
+            "relationships": {
+                "department": "belongsTo Department",
+                "courses": "hasMany ProgramCourse",
+                "batches": "hasMany Batch"
+            }
+        },
+        {
+            "name": "ProgramCourse",
+            "table": "program_courses",
+            "fillable": [
+                "program_id",
+                "course_code",
+                "course_title",
+                "credit_hours"
+            ],
+            "casts": {},
+            "relationships": {
+                "program": "belongsTo Program",
+                "timetables": "hasMany Timetable"
+            }
+        },
+        {
+            "name": "Batch",
+            "table": "batches",
+            "fillable": [
+                "program_id",
+                "batch_name",
+                "start_year",
+                "end_year",
+                "semester",
+                "shift"
+            ],
+            "casts": {},
+            "relationships": {
+                "program": "belongsTo Program",
+                "students": "hasMany Student",
+                "timetables": "hasMany Timetable"
+            }
+        },
+        {
+            "name": "Student",
+            "table": "students",
+            "fillable": [
+                "user_id",
+                "registration_no",
+                "department_id",
+                "batch_id",
+                "phone",
+                "is_blocked",
+                "blocked_by_user_id",
+                "blocked_at"
+            ],
+            "casts": {
+                "is_blocked": "boolean",
+                "blocked_at": "datetime"
+            },
+            "relationships": {
+                "user": "belongsTo User",
+                "department": "belongsTo Department",
+                "batch": "belongsTo Batch",
+                "blockedBy": "belongsTo User (via blocked_by_user_id)",
+                "attendances": "hasMany Attendance"
+            },
+            "accessors": [
+                "attendance_percentage: float — round((present_count / total_count) * 100, 1), 0.0 if no attendance rows exist"
+            ]
+        },
+        {
+            "name": "Room",
+            "table": "rooms",
+            "fillable": [
+                "room_no",
+                "wifi_name",
+                "wifi_mac"
+            ],
+            "casts": {},
+            "relationships": {
+                "timetables": "hasMany Timetable"
+            }
+        },
+        {
+            "name": "TimeSlot",
+            "table": "time_slots",
+            "fillable": [
+                "start_time",
+                "end_time"
+            ],
+            "casts": {},
+            "relationships": {
+                "timetables": "hasMany Timetable (via slot_id)"
+            }
+        },
+        {
+            "name": "Timetable",
+            "table": "timetables",
+            "fillable": [
+                "batch_id",
+                "program_course_id",
+                "teacher_id",
+                "room_id",
+                "day",
+                "slot_id"
+            ],
+            "casts": {},
+            "relationships": {
+                "batch": "belongsTo Batch",
+                "course": "belongsTo ProgramCourse (via program_course_id)",
+                "teacher": "belongsTo Teacher",
+                "room": "belongsTo Room",
+                "timeSlot": "belongsTo TimeSlot (via slot_id)",
+                "sessions": "hasMany ClassSession (via timetable_id)"
+            }
+        },
+        {
+            "name": "ClassSession",
+            "table": "class_sessions",
+            "fillable": [
+                "timetable_id",
+                "session_date",
+                "start_time",
+                "end_time",
+                "status"
+            ],
+            "casts": {
+                "session_date": "date"
+            },
+            "relationships": {
+                "timetable": "belongsTo Timetable",
+                "attendances": "hasMany Attendance (via session_id)"
+            }
+        },
+        {
+            "name": "Attendance",
+            "table": "attendance",
+            "fillable": [
+                "session_id",
+                "student_id",
+                "wifi_mac_detected",
+                "status",
+                "marked_at"
+            ],
+            "casts": {
+                "marked_at": "datetime"
+            },
+            "relationships": {
+                "session": "belongsTo ClassSession (via session_id)",
+                "student": "belongsTo Student"
+            }
+        },
+        {
+            "name": "Notification",
+            "table": "notifications",
+            "fillable": [
+                "user_id",
+                "title",
+                "message",
+                "type",
+                "related_data",
+                "is_read"
+            ],
+            "casts": {
+                "related_data": "array",
+                "is_read": "boolean"
+            },
+            "relationships": {
+                "user": "belongsTo User"
+            },
+            "note": "Plain custom model, not Laravel's polymorphic DatabaseNotification"
+        },
+        {
+            "name": "AuditLog",
+            "table": "audit_logs",
+            "fillable": [
+                "user_id",
+                "action",
+                "description",
+                "model_type",
+                "model_id",
+                "old_values",
+                "new_values",
+                "ip_address",
+                "user_agent"
+            ],
+            "casts": {
+                "old_values": "array",
+                "new_values": "array"
+            },
+            "relationships": {
+                "user": "belongsTo User"
+            },
+            "note": "const UPDATED_AT = null — no updated_at column/timestamp"
+        }
+    ],
+    "api_endpoints": {
+        "response_envelope": "Every endpoint (success or BusinessException error) returns {\"message\": string, \"data\": ...} except: plain validation errors return {\"message\": string, \"errors\": {field: [string]}} with no 'data' key, and 401/middleware 403 return {\"message\": string} with no 'data' key.",
+        "pagination_note": "KNOWN GAP: index endpoints call ->paginate(15) but the controller wraps the Resource collection in a plain {message,data} envelope via response()->json(), which does NOT carry Laravel's automatic pagination meta/links (current_page, last_page, total, etc.) the way returning a ResourceCollection directly would. As implemented today, 'data' is just a flat array of items for every paginated list endpoint — there is no total/current_page/last_page field anywhere in the response. A frontend cannot currently build page-number UI from these responses; it can only request more results by trial since there's no 'has more' signal. Flag this to your frontend dev — fixing it (returning the resource collection directly, or adding ->additional(['meta'=>...])) is a backend change, not something to work around in the client.",
+        "auth": [
+            {
+                "method": "POST",
+                "url": "/api/auth/register",
+                "controller": "Auth\\AuthController@register",
+                "auth_required": false,
+                "allowed_roles": [
+                    "any (public)"
+                ],
+                "form_request": "RegisterRequest",
+                "validation": {
+                    "name": "required|string|max:255",
+                    "email": "required|email|max:255|unique:users,email",
+                    "password": "required|string|min:8|confirmed",
+                    "role": "required|string|in:admin,hod,teacher,student"
+                },
+                "request_body_example": {
+                    "name": "Jane Doe",
+                    "email": "jane@example.com",
+                    "password": "password123",
+                    "password_confirmation": "password123",
+                    "role": "student"
+                },
+                "success_response": {
+                    "status": 201,
+                    "body": {
+                        "message": "Registration successful",
+                        "data": {
+                            "user": {
+                                "id": 27,
+                                "name": "Jane Doe",
+                                "email": "jane@example.com",
+                                "role": "student",
+                                "status": "active",
+                                "created_at": "2026-06-28T09:08:43.000000Z"
+                            },
+                            "token": "13|HxSPQ...cfe0d7fda"
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 422,
+                        "body": {
+                            "message": "The name field is required. (and 3 more errors)",
+                            "errors": {
+                                "name": [
+                                    "The name field is required."
+                                ],
+                                "email": [
+                                    "..."
+                                ],
+                                "password": [
+                                    "..."
+                                ],
+                                "role": [
+                                    "..."
+                                ]
+                            }
+                        }
+                    }
+                ],
+                "note": "Creates a bare User row only — does NOT create a Teacher/Student profile. For role=teacher/student that need a usable profile (department, batch, employee_no, registration_no), use the Admin Teacher/Student creation endpoints instead, which create User+profile atomically."
+            },
+            {
+                "method": "POST",
+                "url": "/api/auth/login",
+                "controller": "Auth\\AuthController@login",
+                "auth_required": false,
+                "allowed_roles": [
+                    "any (public)"
+                ],
+                "form_request": "LoginRequest",
+                "validation": {
+                    "email": "required|email",
+                    "password": "required|string"
+                },
+                "request_body_example": {
+                    "email": "admin@university.edu",
+                    "password": "password"
+                },
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Login successful",
+                        "data": {
+                            "user": {
+                                "id": 1,
+                                "name": "System Administrator",
+                                "email": "admin@university.edu",
+                                "role": "admin",
+                                "status": "active",
+                                "created_at": "2026-06-28T09:05:10.000000Z"
+                            },
+                            "token": "2|zrwSQ...kLQbb7391ad"
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 422,
+                        "body": {
+                            "message": "The provided credentials are incorrect.",
+                            "errors": {
+                                "email": [
+                                    "The provided credentials are incorrect."
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        "status": 403,
+                        "body": {
+                            "message": "Your account is inactive. Please contact the administrator."
+                        }
+                    }
+                ]
+            },
+            {
+                "method": "POST",
+                "url": "/api/auth/logout",
+                "controller": "Auth\\AuthController@logout",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin",
+                    "hod",
+                    "teacher",
+                    "student"
+                ],
+                "form_request": null,
+                "validation": {},
+                "request_body_example": null,
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Logged out successfully",
+                        "data": null
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 401,
+                        "body": {
+                            "message": "Unauthenticated."
+                        }
+                    }
+                ],
+                "note": "Deletes only the current access token (the one used for this request) — other devices/sessions for the same user remain logged in."
+            },
+            {
+                "method": "GET",
+                "url": "/api/auth/user",
+                "controller": "Auth\\AuthController@user",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin",
+                    "hod",
+                    "teacher",
+                    "student"
+                ],
+                "form_request": null,
+                "validation": {},
+                "request_body_example": null,
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Authenticated user",
+                        "data": {
+                            "id": 1,
+                            "name": "System Administrator",
+                            "email": "admin@university.edu",
+                            "role": "admin",
+                            "status": "active",
+                            "created_at": "2026-06-28T09:05:10.000000Z"
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 401,
+                        "body": {
+                            "message": "Unauthenticated."
+                        }
+                    }
+                ],
+                "note": "This is the recommended endpoint for Flutter's role-based navigation decision after login/app-resume — it always reflects the live DB role/status, unlike caching the login response forever."
+            }
+        ],
+        "admin_departments": [
+            {
+                "method": "GET",
+                "url": "/api/departments",
+                "controller": "Admin\\DepartmentController@index",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": null,
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": [
+                            {
+                                "id": 1,
+                                "name": "Computer Science",
+                                "hod_teacher_id": 1,
+                                "hod": {
+                                    "id": 1,
+                                    "user_id": 2,
+                                    "department_id": 1,
+                                    "employee_no": "EMP-001",
+                                    "designation": "Associate Professor",
+                                    "phone": "0300-1234567",
+                                    "is_hod": true,
+                                    "name": "Dr. Ayesha Khan",
+                                    "email": "ayesha.khan@university.edu",
+                                    "status": "active",
+                                    "created_at": "..."
+                                },
+                                "teachers_count": 3,
+                                "students_count": 13,
+                                "created_at": "..."
+                            }
+                        ]
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 403,
+                        "body": {
+                            "message": "You do not have permission to perform this action."
+                        }
+                    }
+                ]
+            },
+            {
+                "method": "POST",
+                "url": "/api/departments",
+                "controller": "Admin\\DepartmentController@store",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "StoreDepartmentRequest",
+                "validation": {
+                    "name": "required|string|max:255|unique:departments,name",
+                    "hod_teacher_id": "nullable|integer|exists:teachers,id"
+                },
+                "request_body_example": {
+                    "name": "Electrical Engineering",
+                    "hod_teacher_id": null
+                },
+                "success_response": {
+                    "status": 201,
+                    "body": {
+                        "message": "Department created",
+                        "data": {
+                            "id": 2,
+                            "name": "Electrical Engineering",
+                            "hod_teacher_id": null,
+                            "hod": null,
+                            "created_at": "..."
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 422,
+                        "body": {
+                            "message": "The name has already been taken.",
+                            "errors": {
+                                "name": [
+                                    "The name has already been taken."
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        "status": 403,
+                        "body": {
+                            "message": "You do not have permission to perform this action."
+                        }
+                    }
+                ]
+            },
+            {
+                "method": "GET",
+                "url": "/api/departments/{department}",
+                "controller": "Admin\\DepartmentController@show",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": null,
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": {
+                            "id": 1,
+                            "name": "Computer Science",
+                            "hod_teacher_id": 1,
+                            "hod": {
+                                "...": "TeacherResource"
+                            },
+                            "teachers_count": 3,
+                            "students_count": 13,
+                            "created_at": "..."
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 404,
+                        "body": {
+                            "message": "No query results for model [App\\Models\\Department] 999"
+                        }
+                    },
+                    {
+                        "status": 403,
+                        "body": {
+                            "message": "You do not have permission to perform this action."
+                        }
+                    }
+                ]
+            },
+            {
+                "method": "PUT",
+                "url": "/api/departments/{department}",
+                "controller": "Admin\\DepartmentController@update",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "UpdateDepartmentRequest",
+                "validation": {
+                    "name": "sometimes|required|string|max:255|unique:departments,name,except_self",
+                    "hod_teacher_id": "nullable|integer|exists:teachers,id"
+                },
+                "request_body_example": {
+                    "hod_teacher_id": 1
+                },
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Department updated",
+                        "data": {
+                            "id": 1,
+                            "name": "Computer Science",
+                            "hod_teacher_id": 1,
+                            "created_at": "..."
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 422,
+                        "body": {
+                            "message": "validation error"
+                        }
+                    },
+                    {
+                        "status": 404,
+                        "body": {
+                            "message": "No query results for model [App\\Models\\Department]"
+                        }
+                    }
+                ]
+            }
+        ],
+        "admin_programs": [
+            {
+                "method": "GET",
+                "url": "/api/programs",
+                "controller": "Admin\\ProgramController@index",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": [
+                            {
+                                "id": 1,
+                                "department_id": 1,
+                                "name": "BS Computer Science",
+                                "code": "BSCS",
+                                "department": {
+                                    "...": "DepartmentResource"
+                                },
+                                "created_at": "..."
+                            }
+                        ]
+                    }
+                }
+            },
+            {
+                "method": "POST",
+                "url": "/api/programs",
+                "controller": "Admin\\ProgramController@store",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "StoreProgramRequest",
+                "validation": {
+                    "department_id": "required|integer|exists:departments,id",
+                    "name": "required|string|max:100",
+                    "code": "required|string|max:20|unique:programs,code"
+                },
+                "request_body_example": {
+                    "department_id": 1,
+                    "name": "BS Software Engineering",
+                    "code": "BSSE"
+                },
+                "success_response": {
+                    "status": 201,
+                    "body": {
+                        "message": "Program created",
+                        "data": {
+                            "id": 3,
+                            "department_id": 1,
+                            "name": "BS Software Engineering",
+                            "code": "BSSE",
+                            "created_at": "..."
+                        }
+                    }
+                }
+            },
+            {
+                "method": "GET",
+                "url": "/api/programs/{program}",
+                "controller": "Admin\\ProgramController@show",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": {
+                            "...": "ProgramResource with department loaded"
+                        }
+                    }
+                }
+            },
+            {
+                "method": "PUT",
+                "url": "/api/programs/{program}",
+                "controller": "Admin\\ProgramController@update",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "UpdateProgramRequest",
+                "validation": {
+                    "department_id": "sometimes|required|integer|exists:departments,id",
+                    "name": "sometimes|required|string|max:100",
+                    "code": "sometimes|required|string|max:20|unique:programs,code,except_self"
+                },
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Program updated",
+                        "data": {
+                            "...": "ProgramResource"
+                        }
+                    }
+                }
+            }
+        ],
+        "admin_program_courses": [
+            {
+                "method": "GET",
+                "url": "/api/program-courses",
+                "controller": "Admin\\ProgramCourseController@index",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": [
+                            {
+                                "id": 1,
+                                "program_id": 1,
+                                "course_code": "CS101",
+                                "course_title": "Introduction to Programming",
+                                "credit_hours": 3,
+                                "program": {
+                                    "...": "ProgramResource"
+                                },
+                                "created_at": "..."
+                            }
+                        ]
+                    }
+                }
+            },
+            {
+                "method": "POST",
+                "url": "/api/program-courses",
+                "controller": "Admin\\ProgramCourseController@store",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "StoreProgramCourseRequest",
+                "validation": {
+                    "program_id": "required|integer|exists:programs,id",
+                    "course_code": "required|string|max:20",
+                    "course_title": "required|string|max:255",
+                    "credit_hours": "required|integer|min:1|max:6"
+                },
+                "request_body_example": {
+                    "program_id": 1,
+                    "course_code": "CS301",
+                    "course_title": "Operating Systems",
+                    "credit_hours": 3
+                },
+                "success_response": {
+                    "status": 201,
+                    "body": {
+                        "message": "Course created",
+                        "data": {
+                            "id": 5,
+                            "program_id": 1,
+                            "course_code": "CS301",
+                            "course_title": "Operating Systems",
+                            "credit_hours": 3,
+                            "created_at": "..."
+                        }
+                    }
+                }
+            },
+            {
+                "method": "GET",
+                "url": "/api/program-courses/{programCourse}",
+                "controller": "Admin\\ProgramCourseController@show",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": {
+                            "...": "ProgramCourseResource"
+                        }
+                    }
+                }
+            },
+            {
+                "method": "PUT",
+                "url": "/api/program-courses/{programCourse}",
+                "controller": "Admin\\ProgramCourseController@update",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "UpdateProgramCourseRequest",
+                "validation": {
+                    "program_id": "sometimes|required|integer|exists:programs,id",
+                    "course_code": "sometimes|required|string|max:20",
+                    "course_title": "sometimes|required|string|max:255",
+                    "credit_hours": "sometimes|required|integer|min:1|max:6"
+                },
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Course updated",
+                        "data": {
+                            "...": "ProgramCourseResource"
+                        }
+                    }
+                }
+            }
+        ],
+        "admin_batches": [
+            {
+                "method": "GET",
+                "url": "/api/batches",
+                "controller": "Admin\\BatchController@index",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": [
+                            {
+                                "id": 1,
+                                "program_id": 1,
+                                "batch_name": "BSCS-2023-M",
+                                "start_year": 2023,
+                                "end_year": 2027,
+                                "semester": 3,
+                                "shift": "Morning",
+                                "program": {
+                                    "...": "ProgramResource"
+                                },
+                                "students_count": 8,
+                                "created_at": "..."
+                            }
+                        ]
+                    }
+                }
+            },
+            {
+                "method": "POST",
+                "url": "/api/batches",
+                "controller": "Admin\\BatchController@store",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "StoreBatchRequest",
+                "validation": {
+                    "program_id": "required|integer|exists:programs,id",
+                    "batch_name": "required|string|max:50",
+                    "start_year": "required|integer|min:2000|max:2100",
+                    "end_year": "required|integer|min:2000|max:2100|gte:start_year",
+                    "semester": "required|integer|min:1|max:8",
+                    "shift": "required|string|in:Morning,Evening"
+                },
+                "request_body_example": {
+                    "program_id": 1,
+                    "batch_name": "BSCS-2025-M",
+                    "start_year": 2025,
+                    "end_year": 2029,
+                    "semester": 1,
+                    "shift": "Morning"
+                },
+                "success_response": {
+                    "status": 201,
+                    "body": {
+                        "message": "Batch created",
+                        "data": {
+                            "id": 4,
+                            "program_id": 1,
+                            "batch_name": "BSCS-2025-M",
+                            "start_year": 2025,
+                            "end_year": 2029,
+                            "semester": 1,
+                            "shift": "Morning",
+                            "created_at": "..."
+                        }
+                    }
+                }
+            },
+            {
+                "method": "GET",
+                "url": "/api/batches/{batch}",
+                "controller": "Admin\\BatchController@show",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": {
+                            "...": "BatchResource with students_count"
+                        }
+                    }
+                }
+            },
+            {
+                "method": "PUT",
+                "url": "/api/batches/{batch}",
+                "controller": "Admin\\BatchController@update",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "UpdateBatchRequest",
+                "validation": {
+                    "program_id": "sometimes|required|integer|exists:programs,id",
+                    "batch_name": "sometimes|required|string|max:50",
+                    "start_year": "sometimes|required|integer|min:2000|max:2100",
+                    "end_year": "sometimes|required|integer|min:2000|max:2100|gte:start_year",
+                    "semester": "sometimes|required|integer|min:1|max:8",
+                    "shift": "sometimes|required|string|in:Morning,Evening"
+                },
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Batch updated",
+                        "data": {
+                            "...": "BatchResource"
+                        }
+                    }
+                }
+            }
+        ],
+        "admin_rooms": [
+            {
+                "method": "GET",
+                "url": "/api/rooms",
+                "controller": "Admin\\RoomController@index",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": [
+                            {
+                                "id": 1,
+                                "room_no": "Room-101",
+                                "wifi_name": "Lab-WiFi-101",
+                                "wifi_mac": "AA:BB:CC:00:01:01",
+                                "created_at": "..."
+                            }
+                        ]
+                    }
+                }
+            },
+            {
+                "method": "POST",
+                "url": "/api/rooms",
+                "controller": "Admin\\RoomController@store",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "StoreRoomRequest",
+                "validation": {
+                    "room_no": "required|string|max:50|unique:rooms,room_no",
+                    "wifi_name": "required|string|max:100",
+                    "wifi_mac": "required|string|regex:/^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/|unique:rooms,wifi_mac"
+                },
+                "request_body_example": {
+                    "room_no": "Room-104",
+                    "wifi_name": "Lab-WiFi-104",
+                    "wifi_mac": "aa:bb:cc:00:01:04"
+                },
+                "success_response": {
+                    "status": 201,
+                    "body": {
+                        "message": "Room created",
+                        "data": {
+                            "id": 4,
+                            "room_no": "Room-104",
+                            "wifi_name": "Lab-WiFi-104",
+                            "wifi_mac": "AA:BB:CC:00:01:04",
+                            "created_at": "..."
+                        }
+                    }
+                },
+                "note": "wifi_mac is normalized to uppercase before saving, on both store and update."
+            },
+            {
+                "method": "GET",
+                "url": "/api/rooms/{room}",
+                "controller": "Admin\\RoomController@show",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": {
+                            "...": "RoomResource"
+                        }
+                    }
+                }
+            },
+            {
+                "method": "PUT",
+                "url": "/api/rooms/{room}",
+                "controller": "Admin\\RoomController@update",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "UpdateRoomRequest",
+                "validation": {
+                    "room_no": "sometimes|required|string|max:50|unique:rooms,room_no,except_self",
+                    "wifi_name": "sometimes|required|string|max:100",
+                    "wifi_mac": "sometimes|required|string|regex(MAC)|unique:rooms,wifi_mac,except_self"
+                },
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Room updated",
+                        "data": {
+                            "...": "RoomResource"
+                        }
+                    }
+                }
+            }
+        ],
+        "admin_time_slots": [
+            {
+                "method": "GET",
+                "url": "/api/time-slots",
+                "controller": "Admin\\TimeSlotController@index",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": [
+                            {
+                                "id": 1,
+                                "start_time": "08:00:00",
+                                "end_time": "09:00:00",
+                                "created_at": "..."
+                            }
+                        ]
+                    }
+                }
+            },
+            {
+                "method": "POST",
+                "url": "/api/time-slots",
+                "controller": "Admin\\TimeSlotController@store",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "StoreTimeSlotRequest",
+                "validation": {
+                    "start_time": "required|date_format:H:i",
+                    "end_time": "required|date_format:H:i|after:start_time"
+                },
+                "request_body_example": {
+                    "start_time": "12:00",
+                    "end_time": "13:00"
+                },
+                "success_response": {
+                    "status": 201,
+                    "body": {
+                        "message": "Time slot created",
+                        "data": {
+                            "id": 5,
+                            "start_time": "12:00:00",
+                            "end_time": "13:00:00",
+                            "created_at": "..."
+                        }
+                    }
+                },
+                "note": "No GET {id} or PUT endpoint exists for time slots — only index + store, matching the original spec exactly."
+            }
+        ],
+        "admin_teachers": [
+            {
+                "method": "GET",
+                "url": "/api/teachers",
+                "controller": "Admin\\TeacherController@index",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": [
+                            {
+                                "id": 2,
+                                "user_id": 3,
+                                "department_id": 1,
+                                "employee_no": "EMP-002",
+                                "designation": "Lecturer",
+                                "phone": "0300-5695534",
+                                "is_hod": false,
+                                "name": "Bilal Ahmed",
+                                "email": "bilal.ahmed@university.edu",
+                                "status": "active",
+                                "department": {
+                                    "...": "DepartmentResource"
+                                },
+                                "created_at": "..."
+                            }
+                        ]
+                    }
+                }
+            },
+            {
+                "method": "POST",
+                "url": "/api/teachers",
+                "controller": "Admin\\TeacherController@store",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "StoreTeacherRequest",
+                "validation": {
+                    "name": "required|string|max:255",
+                    "email": "required|email|max:255|unique:users,email",
+                    "password": "required|string|min:8|confirmed",
+                    "department_id": "required|integer|exists:departments,id",
+                    "employee_no": "required|string|max:50|unique:teachers,employee_no",
+                    "designation": "required|string|max:100",
+                    "phone": "nullable|string|max:20"
+                },
+                "request_body_example": {
+                    "name": "Hira Tariq",
+                    "email": "hira.tariq@university.edu",
+                    "password": "password123",
+                    "password_confirmation": "password123",
+                    "department_id": 2,
+                    "employee_no": "EMP-006",
+                    "designation": "Lecturer",
+                    "phone": "0300-1112223"
+                },
+                "success_response": {
+                    "status": 201,
+                    "body": {
+                        "message": "Teacher created",
+                        "data": {
+                            "id": 6,
+                            "user_id": 28,
+                            "department_id": 2,
+                            "employee_no": "EMP-006",
+                            "designation": "Lecturer",
+                            "phone": "0300-1112223",
+                            "is_hod": false,
+                            "name": "Hira Tariq",
+                            "email": "hira.tariq@university.edu",
+                            "status": "active",
+                            "created_at": "..."
+                        }
+                    }
+                },
+                "note": "Atomically creates a User (role=teacher) and the Teacher profile row via TeacherService::create, in a DB transaction."
+            },
+            {
+                "method": "GET",
+                "url": "/api/teachers/{teacher}",
+                "controller": "Admin\\TeacherController@show",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": {
+                            "...": "TeacherResource with user+department loaded"
+                        }
+                    }
+                }
+            },
+            {
+                "method": "PUT",
+                "url": "/api/teachers/{teacher}",
+                "controller": "Admin\\TeacherController@update",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "UpdateTeacherRequest",
+                "validation": {
+                    "name": "sometimes|required|string|max:255",
+                    "email": "sometimes|required|email|max:255|unique:users,email,except_self",
+                    "department_id": "sometimes|required|integer|exists:departments,id",
+                    "employee_no": "sometimes|required|string|max:50|unique:teachers,employee_no,except_self",
+                    "designation": "sometimes|required|string|max:100",
+                    "phone": "nullable|string|max:20",
+                    "status": "sometimes|required|string|in:active,inactive"
+                },
+                "request_body_example": {
+                    "designation": "Associate Professor",
+                    "status": "active"
+                },
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Teacher updated",
+                        "data": {
+                            "...": "TeacherResource"
+                        }
+                    }
+                },
+                "note": "Updates User fields (name/email/status) and Teacher fields (department_id/employee_no/designation/phone) in one call via TeacherService::update."
+            }
+        ],
+        "admin_students": [
+            {
+                "method": "GET",
+                "url": "/api/students",
+                "controller": "Admin\\StudentController@index",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": [
+                            {
+                                "id": 1,
+                                "user_id": 7,
+                                "registration_no": "CS-23-001",
+                                "department_id": 1,
+                                "batch_id": 1,
+                                "phone": "0300-1234567",
+                                "is_blocked": false,
+                                "blocked_at": null,
+                                "name": "BSCS Student 1",
+                                "email": "bscs.student1@university.edu",
+                                "status": "active",
+                                "department": {
+                                    "...": "DepartmentResource"
+                                },
+                                "batch": {
+                                    "...": "BatchResource"
+                                },
+                                "created_at": "..."
+                            }
+                        ]
+                    }
+                }
+            },
+            {
+                "method": "POST",
+                "url": "/api/students",
+                "controller": "Admin\\StudentController@store",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "StoreStudentRequest",
+                "validation": {
+                    "name": "required|string|max:255",
+                    "email": "required|email|max:255|unique:users,email",
+                    "password": "required|string|min:8|confirmed",
+                    "registration_no": "required|string|max:50|unique:students,registration_no",
+                    "department_id": "required|integer|exists:departments,id",
+                    "batch_id": "required|integer|exists:batches,id",
+                    "phone": "nullable|string|max:20"
+                },
+                "request_body_example": {
+                    "name": "New Student",
+                    "email": "new.student@university.edu",
+                    "password": "password123",
+                    "password_confirmation": "password123",
+                    "registration_no": "CS-25-001",
+                    "department_id": 1,
+                    "batch_id": 1,
+                    "phone": "0300-9998887"
+                },
+                "success_response": {
+                    "status": 201,
+                    "body": {
+                        "message": "Student created",
+                        "data": {
+                            "id": 20,
+                            "user_id": 29,
+                            "registration_no": "CS-25-001",
+                            "department_id": 1,
+                            "batch_id": 1,
+                            "phone": "0300-9998887",
+                            "is_blocked": false,
+                            "blocked_at": null,
+                            "name": "New Student",
+                            "email": "new.student@university.edu",
+                            "status": "active",
+                            "created_at": "..."
+                        }
+                    }
+                },
+                "note": "Atomically creates a User (role=student) and the Student profile row via StudentService::create."
+            },
+            {
+                "method": "GET",
+                "url": "/api/students/{student}",
+                "controller": "Admin\\StudentController@show",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": {
+                            "...": "StudentResource with user+department+batch loaded"
+                        }
+                    }
+                }
+            },
+            {
+                "method": "PUT",
+                "url": "/api/students/{student}",
+                "controller": "Admin\\StudentController@update",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "UpdateStudentRequest",
+                "validation": {
+                    "name": "sometimes|required|string|max:255",
+                    "email": "sometimes|required|email|max:255|unique:users,email,except_self",
+                    "registration_no": "sometimes|required|string|max:50|unique:students,registration_no,except_self",
+                    "department_id": "sometimes|required|integer|exists:departments,id",
+                    "batch_id": "sometimes|required|integer|exists:batches,id",
+                    "phone": "nullable|string|max:20",
+                    "status": "sometimes|required|string|in:active,inactive"
+                },
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Student updated",
+                        "data": {
+                            "...": "StudentResource"
+                        }
+                    }
+                },
+                "note": "IMPORTANT for frontend: this is the only endpoint that can change is_blocked indirectly — actually no, is_blocked is NOT in this request's validated fields at all. Blocking/unblocking only happens via the Teacher-only /students/{id}/block and /unblock endpoints below, never through this admin update endpoint."
+            }
+        ],
+        "admin_timetables": [
+            {
+                "method": "GET",
+                "url": "/api/timetables",
+                "controller": "Admin\\TimetableController@index",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": [
+                            {
+                                "id": 1,
+                                "batch_id": 1,
+                                "program_course_id": 1,
+                                "teacher_id": 2,
+                                "room_id": 1,
+                                "day": "Monday",
+                                "slot_id": 1,
+                                "batch": {
+                                    "...": "BatchResource"
+                                },
+                                "course": {
+                                    "...": "ProgramCourseResource"
+                                },
+                                "teacher": {
+                                    "...": "TeacherResource with user"
+                                },
+                                "room": {
+                                    "...": "RoomResource"
+                                },
+                                "time_slot": {
+                                    "...": "TimeSlotResource"
+                                },
+                                "created_at": "..."
+                            }
+                        ]
+                    }
+                }
+            },
+            {
+                "method": "POST",
+                "url": "/api/timetables",
+                "controller": "Admin\\TimetableController@store",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "StoreTimetableRequest",
+                "validation": {
+                    "batch_id": "required|integer|exists:batches,id",
+                    "program_course_id": "required|integer|exists:program_courses,id",
+                    "teacher_id": "required|integer|exists:teachers,id",
+                    "room_id": "required|integer|exists:rooms,id",
+                    "day": "required|string|in:Monday,Tuesday,Wednesday,Thursday,Friday,Saturday",
+                    "slot_id": "required|integer|exists:time_slots,id"
+                },
+                "request_body_example": {
+                    "batch_id": 1,
+                    "program_course_id": 2,
+                    "teacher_id": 3,
+                    "room_id": 1,
+                    "day": "Friday",
+                    "slot_id": 2
+                },
+                "success_response": {
+                    "status": 201,
+                    "body": {
+                        "message": "Timetable created",
+                        "data": {
+                            "id": 7,
+                            "batch_id": 1,
+                            "program_course_id": 2,
+                            "teacher_id": 3,
+                            "room_id": 1,
+                            "day": "Friday",
+                            "slot_id": 2,
+                            "created_at": "..."
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 409,
+                        "body": {
+                            "message": "This teacher, room, or batch is already scheduled for that day and time slot."
+                        }
+                    }
+                ],
+                "note": "Before saving, TimetableService::ensureNoConflict checks for any existing row with the same day+slot_id that also shares the teacher_id, room_id, OR batch_id — 409 Conflict if found."
+            },
+            {
+                "method": "GET",
+                "url": "/api/timetables/{timetable}",
+                "controller": "Admin\\TimetableController@show",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": {
+                            "...": "TimetableResource fully loaded"
+                        }
+                    }
+                }
+            },
+            {
+                "method": "PUT",
+                "url": "/api/timetables/{timetable}",
+                "controller": "Admin\\TimetableController@update",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "form_request": "UpdateTimetableRequest",
+                "validation": {
+                    "batch_id": "sometimes|required|integer|exists:batches,id",
+                    "program_course_id": "sometimes|required|integer|exists:program_courses,id",
+                    "teacher_id": "sometimes|required|integer|exists:teachers,id",
+                    "room_id": "sometimes|required|integer|exists:rooms,id",
+                    "day": "sometimes|required|string|in:Monday..Saturday",
+                    "slot_id": "sometimes|required|integer|exists:time_slots,id"
+                },
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Timetable updated",
+                        "data": {
+                            "...": "TimetableResource"
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 409,
+                        "body": {
+                            "message": "This teacher, room, or batch is already scheduled for that day and time slot."
+                        }
+                    }
+                ],
+                "note": "Conflict check re-runs on update, excluding the row's own id."
+            }
+        ],
+        "sessions": [
+            {
+                "method": "POST",
+                "url": "/api/sessions/{timetable}/start",
+                "controller": "SessionController@start",
+                "auth_required": true,
+                "allowed_roles": [
+                    "teacher"
+                ],
+                "policy": "TimetablePolicy::start — timetable.teacher.user_id must equal the authenticated user's id",
+                "form_request": null,
+                "validation": {},
+                "request_body_example": null,
+                "success_response": {
+                    "status": 201,
+                    "body": {
+                        "message": "Session started",
+                        "data": {
+                            "id": 2,
+                            "timetable_id": 1,
+                            "session_date": "2026-06-28T00:00:00.000000Z",
+                            "start_time": "08:00:00",
+                            "end_time": "09:00:00",
+                            "status": "active",
+                            "timetable": {
+                                "...": "TimetableResource fully loaded"
+                            },
+                            "present_count": 0,
+                            "absent_count": 8,
+                            "student_count": 8,
+                            "created_at": "..."
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 403,
+                        "body": {
+                            "message": "This action is unauthorized."
+                        }
+                    },
+                    {
+                        "status": 409,
+                        "body": {
+                            "message": "A session for this class is already active today."
+                        }
+                    }
+                ],
+                "side_effects": [
+                    "Creates one class_sessions row (status=active, session_date=today, start/end time copied from the timetable's time_slot)",
+                    "Bulk-inserts one attendance row per student in the timetable's batch, all status=absent",
+                    "Sends 'attendance_started' notification to every one of those students",
+                    "Writes an audit_logs row (action=session_started)"
+                ]
+            },
+            {
+                "method": "POST",
+                "url": "/api/sessions/{session}/end",
+                "controller": "SessionController@end",
+                "auth_required": true,
+                "allowed_roles": [
+                    "teacher"
+                ],
+                "policy": "ClassSessionPolicy::end — session.timetable.teacher.user_id must equal the authenticated user's id",
+                "form_request": null,
+                "validation": {},
+                "request_body_example": null,
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Session ended",
+                        "data": {
+                            "id": 2,
+                            "timetable_id": 1,
+                            "session_date": "2026-06-28T00:00:00.000000Z",
+                            "start_time": "08:00:00",
+                            "end_time": "09:00:00",
+                            "status": "ended",
+                            "timetable": {
+                                "...": "TimetableResource with course"
+                            },
+                            "present_count": 1,
+                            "absent_count": 7,
+                            "student_count": 8,
+                            "created_at": "..."
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 403,
+                        "body": {
+                            "message": "This action is unauthorized."
+                        }
+                    },
+                    {
+                        "status": 409,
+                        "body": {
+                            "message": "This session is not active."
+                        }
+                    }
+                ],
+                "side_effects": [
+                    "Sets class_sessions.status = ended",
+                    "For every attendance row still status=absent, sends an 'attendance_marked' notification to that student (message text says 'marked absent')",
+                    "Sends a 'session_ended' notification to the teacher themself with present/absent counts",
+                    "Writes an audit_logs row (action=session_ended)"
+                ]
+            },
+            {
+                "method": "GET",
+                "url": "/api/sessions/{session}/attendance",
+                "controller": "SessionController@attendance",
+                "auth_required": true,
+                "allowed_roles": [
+                    "teacher"
+                ],
+                "policy": "ClassSessionPolicy::view",
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": {
+                            "session": {
+                                "...": "ClassSessionResource with course"
+                            },
+                            "present_count": 1,
+                            "absent_count": 7,
+                            "students": [
+                                {
+                                    "id": 9,
+                                    "session_id": 2,
+                                    "student_id": 1,
+                                    "wifi_mac_detected": "AA:BB:CC:00:01:01",
+                                    "status": "present",
+                                    "marked_at": "2026-06-28T09:07:09.000000Z",
+                                    "student": {
+                                        "...": "StudentResource with user"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 403,
+                        "body": {
+                            "message": "This action is unauthorized."
+                        }
+                    }
+                ],
+                "note": "Returns the FULL attendance list (not paginated) since a single class's roster is bounded."
+            },
+            {
+                "method": "GET",
+                "url": "/api/sessions",
+                "controller": "SessionController@index",
+                "group": "shared",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin",
+                    "hod",
+                    "teacher",
+                    "student"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": [
+                            {
+                                "...": "ClassSessionResource list"
+                            }
+                        ]
+                    }
+                },
+                "scoping": {
+                    "admin": "all sessions, no filtering",
+                    "teacher": "whereHas timetable.teacher_id = own teacher id",
+                    "student": "whereHas timetable.batch_id = own student's batch_id",
+                    "hod": "whereHas timetable.batch.program.department_id = own teacher.department_id"
+                },
+                "note": "Paginated (15/page) but see the top-level pagination_note — no meta is returned, just a flat array."
+            },
+            {
+                "method": "GET",
+                "url": "/api/sessions/{session}",
+                "controller": "SessionController@show",
+                "group": "shared",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin",
+                    "hod",
+                    "teacher",
+                    "student"
+                ],
+                "policy": "ClassSessionPolicy::view (same scoping rules as index, enforced per-record)",
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": {
+                            "...": "ClassSessionResource with timetable+attendances loaded"
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 403,
+                        "body": {
+                            "message": "This action is unauthorized."
+                        }
+                    },
+                    {
+                        "status": 404,
+                        "body": {
+                            "message": "No query results for model [App\\Models\\ClassSession]"
+                        }
+                    }
+                ]
+            }
+        ],
+        "attendance": [
+            {
+                "method": "POST",
+                "url": "/api/attendance/mark",
+                "controller": "AttendanceController@mark",
+                "auth_required": true,
+                "allowed_roles": [
+                    "student"
+                ],
+                "form_request": "MarkAttendanceRequest",
+                "validation": {
+                    "session_id": "required|integer|exists:class_sessions,id",
+                    "wifi_mac": "required|string|regex:/^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/"
+                },
+                "request_body_example": {
+                    "session_id": 2,
+                    "wifi_mac": "AA:BB:CC:00:01:01"
+                },
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Attendance marked as present",
+                        "data": {
+                            "id": 9,
+                            "session_id": 2,
+                            "student_id": 1,
+                            "wifi_mac_detected": "AA:BB:CC:00:01:01",
+                            "status": "present",
+                            "marked_at": "2026-06-28T09:07:09.000000Z",
+                            "session": {
+                                "...": "ClassSessionResource with timetable"
+                            }
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 422,
+                        "body": {
+                            "message": "This session is not active."
+                        },
+                        "when": "class_sessions.status != active"
+                    },
+                    {
+                        "status": 403,
+                        "body": {
+                            "message": "You are blocked from marking attendance."
+                        },
+                        "when": "students.is_blocked = true"
+                    },
+                    {
+                        "status": 403,
+                        "body": {
+                            "message": "This session does not belong to your batch."
+                        },
+                        "when": "session.timetable.batch_id != student.batch_id"
+                    },
+                    {
+                        "status": 404,
+                        "body": {
+                            "message": "No attendance record was found for you in this session."
+                        },
+                        "when": "no pre-created attendance row exists (shouldn't normally happen — rows are created at session start for the whole batch)"
+                    },
+                    {
+                        "status": 409,
+                        "body": {
+                            "message": "You have already marked attendance for this session."
+                        },
+                        "when": "attendance.status already = present"
+                    },
+                    {
+                        "status": 422,
+                        "body": {
+                            "message": "WiFi network does not match the classroom network."
+                        },
+                        "when": "submitted wifi_mac (case-insensitive) != the session's room.wifi_mac"
+                    }
+                ],
+                "side_effects_on_success": [
+                    "attendance row updated: status=present, marked_at=now(), wifi_mac_detected=uppercased input",
+                    "'attendance_marked' notification sent to the student",
+                    "audit_logs row written (action=attendance_marked)"
+                ],
+                "validation_order": "active session check -> is_blocked check -> batch match check -> attendance row exists check -> already-present check -> WiFi MAC match check"
+            },
+            {
+                "method": "GET",
+                "url": "/api/attendance/report",
+                "controller": "AttendanceController@report",
+                "auth_required": true,
+                "allowed_roles": [
+                    "teacher"
+                ],
+                "query_params": {
+                    "course_id": "nullable|integer|exists:program_courses,id",
+                    "batch_id": "nullable|integer|exists:batches,id",
+                    "date": "nullable|date",
+                    "per_page": "nullable|integer|min:1|max:100"
+                },
+                "request_example": "GET /api/attendance/report?batch_id=1&date=2026-06-28",
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": [
+                            {
+                                "id": 16,
+                                "session_id": 2,
+                                "student_id": 8,
+                                "wifi_mac_detected": null,
+                                "status": "absent",
+                                "marked_at": null,
+                                "student": {
+                                    "...": "StudentResource with user"
+                                },
+                                "session": {
+                                    "...": "ClassSessionResource with timetable.course, timetable.batch"
+                                }
+                            }
+                        ]
+                    }
+                },
+                "scoping": "Always restricted to attendance rows whose session->timetable->teacher_id equals the authenticated teacher's own id, regardless of filters passed — a teacher can never see another teacher's attendance via this endpoint."
+            }
+        ],
+        "teacher_block": [
+            {
+                "method": "POST",
+                "url": "/api/students/{student}/block",
+                "controller": "Teacher\\StudentBlockController@block",
+                "auth_required": true,
+                "allowed_roles": [
+                    "teacher"
+                ],
+                "policy": "StudentPolicy::block — the teacher must have at least one timetable row with batch_id = student.batch_id",
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Student blocked",
+                        "data": {
+                            "id": 2,
+                            "user_id": 8,
+                            "registration_no": "CS-23-002",
+                            "department_id": 1,
+                            "batch_id": 1,
+                            "phone": "0300-8581421",
+                            "is_blocked": true,
+                            "blocked_at": "2026-06-28T09:07:23.000000Z",
+                            "name": "BSCS Student 2",
+                            "email": "bscs.student2@university.edu",
+                            "status": "active",
+                            "created_at": "..."
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 403,
+                        "body": {
+                            "message": "This action is unauthorized."
+                        }
+                    },
+                    {
+                        "status": 409,
+                        "body": {
+                            "message": "Student is already blocked."
+                        }
+                    }
+                ],
+                "side_effects": [
+                    "students.is_blocked=true, blocked_by_user_id=teacher's user id, blocked_at=now()",
+                    "'student_blocked' notification sent to the student",
+                    "audit_logs row written (action=student_blocked)"
+                ]
+            },
+            {
+                "method": "POST",
+                "url": "/api/students/{student}/unblock",
+                "controller": "Teacher\\StudentBlockController@unblock",
+                "auth_required": true,
+                "allowed_roles": [
+                    "teacher"
+                ],
+                "policy": "StudentPolicy::unblock (same ownership rule as block)",
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Student unblocked",
+                        "data": {
+                            "id": 2,
+                            "is_blocked": false,
+                            "blocked_at": null,
+                            "...": "StudentResource"
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 403,
+                        "body": {
+                            "message": "This action is unauthorized."
+                        }
+                    },
+                    {
+                        "status": 409,
+                        "body": {
+                            "message": "Student is not blocked."
+                        }
+                    }
+                ],
+                "side_effects": [
+                    "students.is_blocked=false, blocked_by_user_id=null, blocked_at=null",
+                    "'student_unblocked' notification sent to the student",
+                    "audit_logs row written (action=student_unblocked)"
+                ]
+            }
+        ],
+        "student": [
+            {
+                "method": "GET",
+                "url": "/api/students/today-classes",
+                "controller": "Student\\ScheduleController@todayClasses",
+                "auth_required": true,
+                "allowed_roles": [
+                    "student"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": [
+                            {
+                                "timetable": {
+                                    "...": "TimetableResource (course, teacher.user, room, time_slot)"
+                                },
+                                "session_status": "active",
+                                "session_id": 2,
+                                "attendance_status": "present"
+                            }
+                        ]
+                    }
+                },
+                "field_meanings": {
+                    "session_status": "'active' | 'ended' | 'none' (no session has been started yet today for this timetable slot)",
+                    "session_id": "null when session_status='none'",
+                    "attendance_status": "'present' | 'absent' | null (null when no session exists yet, OR a session exists but this student's row hasn't been checked — in practice it will be 'absent' from session-start until the student marks)"
+                },
+                "logic": "Filters the student's batch timetables to rows where day == today's weekday name (e.g. 'Monday'), then looks up any class_sessions dated today for those timetable_ids, then this student's own attendance row within each found session."
+            },
+            {
+                "method": "GET",
+                "url": "/api/students/schedule",
+                "controller": "Student\\ScheduleController@schedule",
+                "auth_required": true,
+                "allowed_roles": [
+                    "student"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": {
+                            "Monday": [
+                                {
+                                    "...": "TimetableResource"
+                                }
+                            ],
+                            "Tuesday": [
+                                {
+                                    "...": "TimetableResource"
+                                }
+                            ],
+                            "Wednesday": []
+                        }
+                    }
+                },
+                "logic": "All of the student's batch's timetable rows, grouped by the 'day' column, ordered Monday→Saturday. Days with no classes are simply absent as a key (not present with an empty array) — actually grouped via Eloquent groupBy('day') so a day with zero rows for that batch will not appear as a key at all."
+            },
+            {
+                "method": "GET",
+                "url": "/api/students/attendance-history",
+                "controller": "Student\\ScheduleController@attendanceHistory",
+                "auth_required": true,
+                "allowed_roles": [
+                    "student"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": [
+                            {
+                                "id": 9,
+                                "session_id": 2,
+                                "student_id": 1,
+                                "wifi_mac_detected": "AA:BB:CC:00:01:01",
+                                "status": "present",
+                                "marked_at": "2026-06-28T09:07:09.000000Z",
+                                "session": {
+                                    "...": "ClassSessionResource with timetable.course, timetable.room"
+                                },
+                                "created_at": "..."
+                            }
+                        ]
+                    }
+                },
+                "note": "Paginated (15/page), newest first by id. See top-level pagination_note — no page meta currently returned."
+            }
+        ],
+        "notifications": [
+            {
+                "method": "GET",
+                "url": "/api/notifications",
+                "controller": "NotificationController@index",
+                "group": "shared",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin",
+                    "hod",
+                    "teacher",
+                    "student"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": [
+                            {
+                                "id": 17,
+                                "title": "Attendance Marked",
+                                "message": "You have been marked present for this session.",
+                                "type": "attendance_marked",
+                                "related_data": {
+                                    "session_id": 2,
+                                    "status": "present"
+                                },
+                                "is_read": false,
+                                "created_at": "..."
+                            }
+                        ]
+                    }
+                },
+                "note": "Scoped to the authenticated user's own notifications only ($request->user()->notifications()). Paginated (15/page) — see pagination_note."
+            },
+            {
+                "method": "PUT",
+                "url": "/api/notifications/{notification}/read",
+                "controller": "NotificationController@markRead",
+                "group": "shared",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin",
+                    "hod",
+                    "teacher",
+                    "student"
+                ],
+                "policy": "NotificationPolicy::view — notification.user_id must equal the authenticated user's id",
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Notification marked as read",
+                        "data": {
+                            "id": 17,
+                            "is_read": true,
+                            "...": "NotificationResource"
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 403,
+                        "body": {
+                            "message": "This action is unauthorized."
+                        }
+                    },
+                    {
+                        "status": 404,
+                        "body": {
+                            "message": "No query results for model [App\\Models\\Notification]"
+                        }
+                    }
+                ]
+            },
+            {
+                "method": "DELETE",
+                "url": "/api/notifications/{notification}",
+                "controller": "NotificationController@destroy",
+                "group": "shared",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin",
+                    "hod",
+                    "teacher",
+                    "student"
+                ],
+                "policy": "NotificationPolicy::delete — same ownership rule",
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Notification deleted",
+                        "data": null
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 403,
+                        "body": {
+                            "message": "This action is unauthorized."
+                        }
+                    }
+                ]
+            }
+        ],
+        "dashboard": [
+            {
+                "method": "GET",
+                "url": "/api/dashboard/admin",
+                "controller": "DashboardController@admin",
+                "auth_required": true,
+                "allowed_roles": [
+                    "admin"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": {
+                            "counts": {
+                                "departments": 2,
+                                "programs": 2,
+                                "batches": 3,
+                                "teachers": 5,
+                                "students": 19,
+                                "rooms": 3,
+                                "active_sessions": 0
+                            },
+                            "recent_activities": [
+                                {
+                                    "id": 1,
+                                    "user_id": 1,
+                                    "action": "database_seeded",
+                                    "description": "Demo dataset seeded for development and testing.",
+                                    "model_type": null,
+                                    "model_id": null,
+                                    "old_values": null,
+                                    "new_values": null,
+                                    "ip_address": null,
+                                    "created_at": "..."
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
+            {
+                "method": "GET",
+                "url": "/api/dashboard/hod",
+                "controller": "DashboardController@hod",
+                "auth_required": true,
+                "allowed_roles": [
+                    "hod"
+                ],
+                "request_body_example": null,
+                "request_example_curl": "GET /api/dashboard/hod\nHeaders: Authorization: Bearer {hod_token}, Accept: application/json",
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": {
+                            "department": {
+                                "id": 1,
+                                "name": "Computer Science",
+                                "hod_teacher_id": 1,
+                                "hod": {
+                                    "id": 1,
+                                    "user_id": 2,
+                                    "department_id": 1,
+                                    "employee_no": "EMP-001",
+                                    "designation": "Associate Professor",
+                                    "phone": "0300-4883805",
+                                    "is_hod": true,
+                                    "name": "Dr. Ayesha Khan",
+                                    "email": "ayesha.khan@university.edu",
+                                    "status": "active",
+                                    "created_at": "2026-06-28T09:05:10.000000Z"
+                                },
+                                "teachers_count": 3,
+                                "students_count": 13,
+                                "created_at": "2026-06-28T09:05:10.000000Z"
+                            },
+                            "teachers_count": 3,
+                            "students_count": 13,
+                            "today_sessions_count": 1,
+                            "today_attendance_percentage": 12.5
+                        }
+                    }
+                },
+                "error_responses": [
+                    {
+                        "status": 404,
+                        "body": {
+                            "message": "No department is assigned to this HOD account."
+                        },
+                        "when": "the authenticated HOD user's Teacher profile has no department, or the user has no Teacher profile at all"
+                    },
+                    {
+                        "status": 401,
+                        "body": {
+                            "message": "Unauthenticated."
+                        }
+                    },
+                    {
+                        "status": 403,
+                        "body": {
+                            "message": "You do not have permission to perform this action."
+                        },
+                        "when": "a non-hod role token calls this endpoint (role:hod middleware)"
+                    }
+                ],
+                "resolution_logic": "DashboardService::hod($user) resolves the department via $user->teacher->department (NOT via departments.hod_teacher_id lookup) — i.e. it trusts the HOD's own teacher.department_id, which in the seeded data is set to match the department they head. teachers_count/students_count are plain counts of Teacher/Student rows with that department_id. today_sessions_count counts class_sessions dated today whose timetable->batch->program->department_id matches. today_attendance_percentage = round(present_attendance_rows_today / total_attendance_rows_today * 100, 1) across all of today's sessions in the department, or 0.0 if no sessions ran today.",
+                "implemented_endpoints_for_hod_role": "This dashboard call is the ONLY hod-specific endpoint in the codebase. For anything beyond this summary (e.g. a full list of the department's teachers, students, or a drill-down attendance report), the HOD role currently has no dedicated endpoint — only the shared GET /api/sessions (auto-scoped to their department) and GET /api/notifications. If the frontend needs a 'view all teachers in my department' or 'view all students in my department' screen for HOD, those endpoints do not exist yet and would need to be added to the backend (likely Admin\\TeacherController@index and Admin\\StudentController@index reused with a hod-aware scope, or new HOD-specific controllers)."
+            },
+            {
+                "method": "GET",
+                "url": "/api/dashboard/teacher",
+                "controller": "DashboardController@teacher",
+                "auth_required": true,
+                "allowed_roles": [
+                    "teacher"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": {
+                            "today_classes": [
+                                {
+                                    "...": "TimetableResource (course, room, time_slot, batch)"
+                                }
+                            ],
+                            "today_classes_count": 2,
+                            "today_sessions_started": 1
+                        }
+                    }
+                },
+                "logic": "today_classes = this teacher's timetable rows where day == today's weekday name. today_sessions_started = count of class_sessions dated today whose timetable_id is one of those today_classes ids."
+            },
+            {
+                "method": "GET",
+                "url": "/api/dashboard/student",
+                "controller": "DashboardController@student",
+                "auth_required": true,
+                "allowed_roles": [
+                    "student"
+                ],
+                "success_response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Success",
+                        "data": {
+                            "today_classes_count": 1,
+                            "attendance_percentage": 87.5
+                        }
+                    }
+                },
+                "logic": "today_classes_count = count of the student's batch's timetable rows for today's weekday. attendance_percentage = Student model's attendance_percentage accessor: round(present/total*100, 1) over ALL of the student's attendance history, not just today."
+            }
+        ]
+    },
+    "resources": [
+        {
+            "name": "UserResource",
+            "fields": [
+                "id",
+                "name",
+                "email",
+                "role",
+                "status",
+                "created_at"
+            ]
+        },
+        {
+            "name": "DepartmentResource",
+            "fields": [
+                "id",
+                "name",
+                "hod_teacher_id",
+                "hod (TeacherResource, whenLoaded)",
+                "teachers_count (whenCounted)",
+                "students_count (whenCounted)",
+                "created_at"
+            ]
+        },
+        {
+            "name": "ProgramResource",
+            "fields": [
+                "id",
+                "department_id",
+                "name",
+                "code",
+                "department (DepartmentResource, whenLoaded)",
+                "created_at"
+            ]
+        },
+        {
+            "name": "ProgramCourseResource",
+            "fields": [
+                "id",
+                "program_id",
+                "course_code",
+                "course_title",
+                "credit_hours",
+                "program (ProgramResource, whenLoaded)",
+                "created_at"
+            ]
+        },
+        {
+            "name": "BatchResource",
+            "fields": [
+                "id",
+                "program_id",
+                "batch_name",
+                "start_year",
+                "end_year",
+                "semester",
+                "shift",
+                "program (ProgramResource, whenLoaded)",
+                "students_count (whenCounted)",
+                "created_at"
+            ]
+        },
+        {
+            "name": "RoomResource",
+            "fields": [
+                "id",
+                "room_no",
+                "wifi_name",
+                "wifi_mac",
+                "created_at"
+            ]
+        },
+        {
+            "name": "TimeSlotResource",
+            "fields": [
+                "id",
+                "start_time",
+                "end_time",
+                "created_at"
+            ]
+        },
+        {
+            "name": "TeacherResource",
+            "fields": [
+                "id",
+                "user_id",
+                "department_id",
+                "employee_no",
+                "designation",
+                "phone",
+                "is_hod (model accessor)",
+                "name (whenLoaded user)",
+                "email (whenLoaded user)",
+                "status (whenLoaded user)",
+                "department (DepartmentResource, whenLoaded)",
+                "created_at"
+            ]
+        },
+        {
+            "name": "StudentResource",
+            "fields": [
+                "id",
+                "user_id",
+                "registration_no",
+                "department_id",
+                "batch_id",
+                "phone",
+                "is_blocked",
+                "blocked_at",
+                "name (whenLoaded user)",
+                "email (whenLoaded user)",
+                "status (whenLoaded user)",
+                "department (DepartmentResource, whenLoaded)",
+                "batch (BatchResource, whenLoaded)",
+                "attendance_percentage (only when attendances relation is loaded)",
+                "created_at"
+            ]
+        },
+        {
+            "name": "TimetableResource",
+            "fields": [
+                "id",
+                "batch_id",
+                "program_course_id",
+                "teacher_id",
+                "room_id",
+                "day",
+                "slot_id",
+                "batch (BatchResource, whenLoaded)",
+                "course (ProgramCourseResource, whenLoaded)",
+                "teacher (TeacherResource, whenLoaded)",
+                "room (RoomResource, whenLoaded)",
+                "time_slot (TimeSlotResource, whenLoaded)",
+                "created_at"
+            ]
+        },
+        {
+            "name": "ClassSessionResource",
+            "fields": [
+                "id",
+                "timetable_id",
+                "session_date",
+                "start_time",
+                "end_time",
+                "status",
+                "timetable (TimetableResource, whenLoaded)",
+                "present_count (only when attendances loaded)",
+                "absent_count (only when attendances loaded)",
+                "student_count (only when attendances loaded)",
+                "created_at"
+            ]
+        },
+        {
+            "name": "AttendanceResource",
+            "fields": [
+                "id",
+                "session_id",
+                "student_id",
+                "wifi_mac_detected",
+                "status",
+                "marked_at",
+                "student (StudentResource, whenLoaded)",
+                "session (ClassSessionResource, whenLoaded)",
+                "created_at"
+            ]
+        },
+        {
+            "name": "NotificationResource",
+            "fields": [
+                "id",
+                "title",
+                "message",
+                "type",
+                "related_data",
+                "is_read",
+                "created_at"
+            ],
+            "note": "id/user_id distinction: 'id' is the notification's own primary key; user_id is intentionally NOT exposed since the list is always pre-scoped to the requesting user."
+        },
+        {
+            "name": "AuditLogResource",
+            "fields": [
+                "id",
+                "user_id",
+                "action",
+                "description",
+                "model_type",
+                "model_id",
+                "old_values",
+                "new_values",
+                "ip_address",
+                "created_at"
+            ],
+            "note": "user_agent is captured in the DB but deliberately omitted from the API response."
+        }
+    ],
+    "form_requests": [
+        {
+            "name": "RegisterRequest",
+            "rules": {
+                "name": "required|string|max:255",
+                "email": "required|email|max:255|unique:users,email",
+                "password": "required|string|min:8|confirmed",
+                "role": "required|string|in:admin,hod,teacher,student"
+            }
+        },
+        {
+            "name": "LoginRequest",
+            "rules": {
+                "email": "required|email",
+                "password": "required|string"
+            }
+        },
+        {
+            "name": "StoreDepartmentRequest",
+            "rules": {
+                "name": "required|string|max:255|unique:departments,name",
+                "hod_teacher_id": "nullable|integer|exists:teachers,id"
+            }
+        },
+        {
+            "name": "UpdateDepartmentRequest",
+            "rules": {
+                "name": "sometimes|required|string|max:255|unique:departments,name,{ignore self}",
+                "hod_teacher_id": "nullable|integer|exists:teachers,id"
+            }
+        },
+        {
+            "name": "StoreProgramRequest",
+            "rules": {
+                "department_id": "required|integer|exists:departments,id",
+                "name": "required|string|max:100",
+                "code": "required|string|max:20|unique:programs,code"
+            }
+        },
+        {
+            "name": "UpdateProgramRequest",
+            "rules": {
+                "department_id": "sometimes|required|integer|exists:departments,id",
+                "name": "sometimes|required|string|max:100",
+                "code": "sometimes|required|string|max:20|unique:programs,code,{ignore self}"
+            }
+        },
+        {
+            "name": "StoreProgramCourseRequest",
+            "rules": {
+                "program_id": "required|integer|exists:programs,id",
+                "course_code": "required|string|max:20",
+                "course_title": "required|string|max:255",
+                "credit_hours": "required|integer|min:1|max:6"
+            }
+        },
+        {
+            "name": "UpdateProgramCourseRequest",
+            "rules": {
+                "program_id": "sometimes|required|integer|exists:programs,id",
+                "course_code": "sometimes|required|string|max:20",
+                "course_title": "sometimes|required|string|max:255",
+                "credit_hours": "sometimes|required|integer|min:1|max:6"
+            }
+        },
+        {
+            "name": "StoreBatchRequest",
+            "rules": {
+                "program_id": "required|integer|exists:programs,id",
+                "batch_name": "required|string|max:50",
+                "start_year": "required|integer|min:2000|max:2100",
+                "end_year": "required|integer|min:2000|max:2100|gte:start_year",
+                "semester": "required|integer|min:1|max:8",
+                "shift": "required|string|in:Morning,Evening"
+            }
+        },
+        {
+            "name": "UpdateBatchRequest",
+            "rules": {
+                "program_id": "sometimes|required|integer|exists:programs,id",
+                "batch_name": "sometimes|required|string|max:50",
+                "start_year": "sometimes|required|integer|min:2000|max:2100",
+                "end_year": "sometimes|required|integer|min:2000|max:2100|gte:start_year",
+                "semester": "sometimes|required|integer|min:1|max:8",
+                "shift": "sometimes|required|string|in:Morning,Evening"
+            }
+        },
+        {
+            "name": "StoreRoomRequest",
+            "rules": {
+                "room_no": "required|string|max:50|unique:rooms,room_no",
+                "wifi_name": "required|string|max:100",
+                "wifi_mac": "required|string|regex:/^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/|unique:rooms,wifi_mac"
+            }
+        },
+        {
+            "name": "UpdateRoomRequest",
+            "rules": {
+                "room_no": "sometimes|required|string|max:50|unique:rooms,room_no,{ignore self}",
+                "wifi_name": "sometimes|required|string|max:100",
+                "wifi_mac": "sometimes|required|string|regex(MAC)|unique:rooms,wifi_mac,{ignore self}"
+            }
+        },
+        {
+            "name": "StoreTimeSlotRequest",
+            "rules": {
+                "start_time": "required|date_format:H:i",
+                "end_time": "required|date_format:H:i|after:start_time"
+            }
+        },
+        {
+            "name": "StoreTeacherRequest",
+            "rules": {
+                "name": "required|string|max:255",
+                "email": "required|email|max:255|unique:users,email",
+                "password": "required|string|min:8|confirmed",
+                "department_id": "required|integer|exists:departments,id",
+                "employee_no": "required|string|max:50|unique:teachers,employee_no",
+                "designation": "required|string|max:100",
+                "phone": "nullable|string|max:20"
+            }
+        },
+        {
+            "name": "UpdateTeacherRequest",
+            "rules": {
+                "name": "sometimes|required|string|max:255",
+                "email": "sometimes|required|email|max:255|unique:users,email,{ignore self via teacher.user_id}",
+                "department_id": "sometimes|required|integer|exists:departments,id",
+                "employee_no": "sometimes|required|string|max:50|unique:teachers,employee_no,{ignore self}",
+                "designation": "sometimes|required|string|max:100",
+                "phone": "nullable|string|max:20",
+                "status": "sometimes|required|string|in:active,inactive"
+            }
+        },
+        {
+            "name": "StoreStudentRequest",
+            "rules": {
+                "name": "required|string|max:255",
+                "email": "required|email|max:255|unique:users,email",
+                "password": "required|string|min:8|confirmed",
+                "registration_no": "required|string|max:50|unique:students,registration_no",
+                "department_id": "required|integer|exists:departments,id",
+                "batch_id": "required|integer|exists:batches,id",
+                "phone": "nullable|string|max:20"
+            }
+        },
+        {
+            "name": "UpdateStudentRequest",
+            "rules": {
+                "name": "sometimes|required|string|max:255",
+                "email": "sometimes|required|email|max:255|unique:users,email,{ignore self via student.user_id}",
+                "registration_no": "sometimes|required|string|max:50|unique:students,registration_no,{ignore self}",
+                "department_id": "sometimes|required|integer|exists:departments,id",
+                "batch_id": "sometimes|required|integer|exists:batches,id",
+                "phone": "nullable|string|max:20",
+                "status": "sometimes|required|string|in:active,inactive"
+            }
+        },
+        {
+            "name": "StoreTimetableRequest",
+            "rules": {
+                "batch_id": "required|integer|exists:batches,id",
+                "program_course_id": "required|integer|exists:program_courses,id",
+                "teacher_id": "required|integer|exists:teachers,id",
+                "room_id": "required|integer|exists:rooms,id",
+                "day": "required|string|in:Monday,Tuesday,Wednesday,Thursday,Friday,Saturday",
+                "slot_id": "required|integer|exists:time_slots,id"
+            }
+        },
+        {
+            "name": "UpdateTimetableRequest",
+            "rules": {
+                "batch_id": "sometimes|required|integer|exists:batches,id",
+                "program_course_id": "sometimes|required|integer|exists:program_courses,id",
+                "teacher_id": "sometimes|required|integer|exists:teachers,id",
+                "room_id": "sometimes|required|integer|exists:rooms,id",
+                "day": "sometimes|required|string|in:Monday..Saturday",
+                "slot_id": "sometimes|required|integer|exists:time_slots,id"
+            }
+        },
+        {
+            "name": "MarkAttendanceRequest",
+            "rules": {
+                "session_id": "required|integer|exists:class_sessions,id",
+                "wifi_mac": "required|string|regex:/^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/"
+            }
+        }
+    ],
+    "services": [
+        {
+            "name": "SessionService",
+            "methods": {
+                "start(timetable, teacherUser)": "409 if a session for that timetable is already active today; else creates the class_sessions row, bulk-inserts absent attendance rows for the whole batch, fires attendance_started notifications, writes an audit log",
+                "end(session, teacherUser)": "409 if not active; else sets ended, notifies all still-absent students (attendance_marked), notifies the teacher (session_ended) with counts, writes an audit log"
+            }
+        },
+        {
+            "name": "AttendanceService",
+            "methods": {
+                "mark(session, student, wifiMac)": "Runs the 6-step validation chain documented under the /api/attendance/mark endpoint, then flips the attendance row to present, fires an attendance_marked notification, writes an audit log"
+            }
+        },
+        {
+            "name": "StudentBlockService",
+            "methods": {
+                "block(student, teacher)": "Verifies teacher.id appears in a timetable with the student's batch_id (else 403); 409 if already blocked; else sets block fields, notifies student, audit log",
+                "unblock(student, teacher)": "Same ownership check; 409 if not blocked; else clears block fields, notifies student, audit log"
+            }
+        },
+        {
+            "name": "NotificationService",
+            "methods": {
+                "send(userId, title, message, type, relatedData=[])": "Inserts a single notifications row",
+                "sendMany(userIds, title, message, type, relatedData=[])": "Bulk-inserts one notifications row per user id (used when a session starts, to notify the whole batch in one query)"
+            }
+        },
+        {
+            "name": "AuditLogService",
+            "methods": {
+                "log(userId, action, description, model=null, oldValues=null, newValues=null)": "Inserts an audit_logs row, capturing the current request's IP and user agent automatically"
+            }
+        },
+        {
+            "name": "TimetableService",
+            "methods": {
+                "ensureNoConflict(data, ignoreId=null)": "Throws BusinessException(409) if any other timetable row shares the same day+slot_id AND (same teacher_id OR same room_id OR same batch_id). Used by both store and update."
+            }
+        },
+        {
+            "name": "TeacherService",
+            "methods": {
+                "create(data)": "DB transaction: creates User(role=teacher) then Teacher profile referencing it",
+                "update(teacher, data)": "Updates User fields (name/email/status) and Teacher fields (department_id/employee_no/designation/phone) from whichever keys are present in data"
+            }
+        },
+        {
+            "name": "StudentService",
+            "methods": {
+                "create(data)": "DB transaction: creates User(role=student) then Student profile referencing it",
+                "update(student, data)": "Updates User fields (name/email/status) and Student fields (registration_no/department_id/batch_id/phone) from whichever keys are present"
+            }
+        },
+        {
+            "name": "AttendanceReportService",
+            "methods": {
+                "generate(teacher, filters)": "Builds a paginated Attendance query always scoped to session.timetable.teacher_id = teacher.id, optionally narrowed by course_id, batch_id, and date filters"
+            }
+        },
+        {
+            "name": "DashboardService",
+            "methods": {
+                "admin()": "Entity counts + last 10 audit log rows",
+                "hod(user)": "Resolves department via user.teacher.department; throws 404 BusinessException if none; returns department + counts + today's session count + today's attendance percentage for the whole department",
+                "teacher(user)": "Today's timetable rows for this teacher (matched by weekday name) + how many of those already have a session started today",
+                "student(user)": "Today's class count for the student's batch (by weekday name) + the student's all-time attendance percentage"
+            }
+        }
+    ],
+    "notifications": {
+        "implementation_note": "These are plain rows inserted directly into the 'notifications' table by NotificationService — there are no app/Notifications/*.php classes and no use of Laravel's built-in Notification facade/channels. The table's type enum only has 5 values even though the original spec described 6 flows; 'marked absent' uses the same type='attendance_marked' as 'marked present', distinguished only by the message text and related_data.status field.",
+        "types": [
+            {
+                "type": "attendance_started",
+                "trigger": "POST /api/sessions/{timetable}/start succeeds",
+                "receiver": "Every student in the timetable's batch (bulk-sent via sendMany)",
+                "payload_example": {
+                    "title": "Attendance Started",
+                    "message": "Attendance has started for Introduction to Programming. Connect to \"Lab-WiFi-101\" to mark your attendance.",
+                    "type": "attendance_started",
+                    "related_data": {
+                        "session_id": 2,
+                        "room_wifi_mac": "AA:BB:CC:00:01:01",
+                        "room_wifi_name": "Lab-WiFi-101"
+                    }
+                }
+            },
+            {
+                "type": "attendance_marked",
+                "trigger": "Two distinct triggers share this one type: (1) POST /api/attendance/mark succeeds (student marked present themself), (2) POST /api/sessions/{session}/end runs and a student's attendance row is still 'absent'",
+                "receiver": "The individual student in question",
+                "payload_example_present": {
+                    "title": "Attendance Marked",
+                    "message": "You have been marked present for this session.",
+                    "type": "attendance_marked",
+                    "related_data": {
+                        "session_id": 2,
+                        "status": "present"
+                    }
+                },
+                "payload_example_absent": {
+                    "title": "Attendance Marked",
+                    "message": "You were marked absent for this session.",
+                    "type": "attendance_marked",
+                    "related_data": {
+                        "session_id": 2,
+                        "status": "absent"
+                    }
+                }
+            },
+            {
+                "type": "session_ended",
+                "trigger": "POST /api/sessions/{session}/end succeeds",
+                "receiver": "The teacher who ended the session (not the students)",
+                "payload_example": {
+                    "title": "Session Ended",
+                    "message": "Session ended: 1 present, 7 absent.",
+                    "type": "session_ended",
+                    "related_data": {
+                        "session_id": 2,
+                        "present": 1,
+                        "absent": 7
+                    }
+                }
+            },
+            {
+                "type": "student_blocked",
+                "trigger": "POST /api/students/{student}/block succeeds",
+                "receiver": "The blocked student",
+                "payload_example": {
+                    "title": "Account Blocked",
+                    "message": "You have been blocked from marking attendance by your teacher.",
+                    "type": "student_blocked",
+                    "related_data": null
+                }
+            },
+            {
+                "type": "student_unblocked",
+                "trigger": "POST /api/students/{student}/unblock succeeds",
+                "receiver": "The unblocked student",
+                "payload_example": {
+                    "title": "Account Unblocked",
+                    "message": "You have been unblocked and can mark attendance again.",
+                    "type": "student_unblocked",
+                    "related_data": null
+                }
+            }
+        ]
+    },
+    "attendance_flow": {
+        "description": "End-to-end lifecycle of a single class session, in the order it actually happens.",
+        "steps": [
+            {
+                "step": 1,
+                "actor": "Teacher",
+                "action": "POST /api/sessions/{timetable}/start",
+                "preconditions": [
+                    "Authenticated as teacher",
+                    "timetable.teacher.user_id == authenticated user id (TimetablePolicy)",
+                    "No active session already exists for this timetable today"
+                ],
+                "system_actions": [
+                    "Insert class_sessions row: status=active, session_date=today, start_time/end_time copied from the timetable's time_slot",
+                    "Query every Student where batch_id = timetable.batch_id",
+                    "Bulk-insert one attendance row per student: status=absent, wifi_mac_detected=null, marked_at=null",
+                    "NotificationService::sendMany -> type=attendance_started to every one of those students, payload includes the room's wifi_name and wifi_mac",
+                    "AuditLogService::log(action=session_started)"
+                ],
+                "response": {
+                    "status": 201,
+                    "body": {
+                        "message": "Session started",
+                        "data": {
+                            "id": 2,
+                            "status": "active",
+                            "present_count": 0,
+                            "absent_count": 8,
+                            "student_count": 8
+                        }
+                    }
+                }
+            },
+            {
+                "step": 2,
+                "actor": "Student",
+                "action": "POST /api/attendance/mark {session_id, wifi_mac}",
+                "preconditions": [
+                    "Authenticated as student",
+                    "session.status == active",
+                    "student.is_blocked == false",
+                    "session.timetable.batch_id == student.batch_id",
+                    "an attendance row exists for (session_id, student_id)",
+                    "that attendance row's status != present",
+                    "wifi_mac (case-insensitive) == session.timetable.room.wifi_mac"
+                ],
+                "system_actions": [
+                    "Update the attendance row: status=present, marked_at=now(), wifi_mac_detected=uppercase(wifi_mac)",
+                    "NotificationService::send -> type=attendance_marked, status=present, to this student",
+                    "AuditLogService::log(action=attendance_marked)"
+                ],
+                "response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Attendance marked as present",
+                        "data": {
+                            "status": "present",
+                            "marked_at": "..."
+                        }
+                    }
+                },
+                "repeats": "This step repeats independently for every student in the batch who chooses to mark — each is a separate API call, there is no batch-marking endpoint."
+            },
+            {
+                "step": 3,
+                "actor": "Teacher",
+                "action": "POST /api/sessions/{session}/end",
+                "preconditions": [
+                    "Authenticated as teacher",
+                    "session.timetable.teacher.user_id == authenticated user id (ClassSessionPolicy::end)",
+                    "session.status == active"
+                ],
+                "system_actions": [
+                    "Update class_sessions.status = ended",
+                    "For every attendance row still status=absent: NotificationService::send -> type=attendance_marked, status=absent, to that student",
+                    "NotificationService::send -> type=session_ended, to the teacher, with present/absent counts",
+                    "AuditLogService::log(action=session_ended)"
+                ],
+                "response": {
+                    "status": 200,
+                    "body": {
+                        "message": "Session ended",
+                        "data": {
+                            "status": "ended",
+                            "present_count": 1,
+                            "absent_count": 7,
+                            "student_count": 8
+                        }
+                    }
+                }
+            }
+        ],
+        "important_caveats": [
+            "There is no automatic time-based session ending — a teacher must explicitly call the end endpoint, even after the time_slot's end_time has passed; the system does not enforce session duration server-side.",
+            "Attendance rows are created for ALL batch students at session-start time, not lazily when a student first interacts — so a student who never opens the app for that class will simply remain 'absent' once the teacher ends the session.",
+            "WiFi MAC comparison is case-insensitive (both sides uppercased) but otherwise exact-match — there is no fuzzy/partial matching or distance/signal-strength heuristic."
+        ]
+    },
+    "dashboard": {
+        "note": "Full request/response/error detail for all 4 dashboards is under api_endpoints.dashboard — this section is a quick-reference summary, with HOD repeated in full per request.",
+        "admin": {
+            "endpoint": "GET /api/dashboard/admin",
+            "role": "admin",
+            "response_shape": {
+                "counts": {
+                    "departments": "int",
+                    "programs": "int",
+                    "batches": "int",
+                    "teachers": "int",
+                    "students": "int",
+                    "rooms": "int",
+                    "active_sessions": "int"
+                },
+                "recent_activities": "AuditLogResource[] (last 10)"
+            }
+        },
+        "hod": {
+            "endpoint": "GET /api/dashboard/hod",
+            "role": "hod",
+            "auth_header": "Authorization: Bearer {hod_token}",
+            "response_shape": {
+                "department": "DepartmentResource",
+                "teachers_count": "int",
+                "students_count": "int",
+                "today_sessions_count": "int",
+                "today_attendance_percentage": "float (0.0 if no sessions ran today)"
+            },
+            "full_example_response": {
+                "message": "Success",
+                "data": {
+                    "department": {
+                        "id": 1,
+                        "name": "Computer Science",
+                        "hod_teacher_id": 1,
+                        "hod": {
+                            "id": 1,
+                            "user_id": 2,
+                            "department_id": 1,
+                            "employee_no": "EMP-001",
+                            "designation": "Associate Professor",
+                            "phone": "0300-4883805",
+                            "is_hod": true,
+                            "name": "Dr. Ayesha Khan",
+                            "email": "ayesha.khan@university.edu",
+                            "status": "active",
+                            "created_at": "2026-06-28T09:05:10.000000Z"
+                        },
+                        "teachers_count": 3,
+                        "students_count": 13,
+                        "created_at": "2026-06-28T09:05:10.000000Z"
+                    },
+                    "teachers_count": 3,
+                    "students_count": 13,
+                    "today_sessions_count": 1,
+                    "today_attendance_percentage": 12.5
+                }
+            },
+            "error_example": {
+                "status": 404,
+                "body": {
+                    "message": "No department is assigned to this HOD account."
+                }
+            },
+            "gap_for_frontend": "No other HOD-specific endpoint exists (no department teacher-list, student-list, or report drill-down for HOD) — only this dashboard summary plus the role-agnostic shared GET /sessions (auto department-scoped) and GET /notifications."
+        },
+        "teacher": {
+            "endpoint": "GET /api/dashboard/teacher",
+            "role": "teacher",
+            "response_shape": {
+                "today_classes": "TimetableResource[]",
+                "today_classes_count": "int",
+                "today_sessions_started": "int"
+            }
+        },
+        "student": {
+            "endpoint": "GET /api/dashboard/student",
+            "role": "student",
+            "response_shape": {
+                "today_classes_count": "int",
+                "attendance_percentage": "float"
+            }
+        }
+    },
+    "policies": [
+        {
+            "name": "TimetablePolicy",
+            "ability": "start(user, timetable)",
+            "rule": "user.isTeacher() AND timetable.teacher.user_id == user.id",
+            "used_by": "POST /api/sessions/{timetable}/start"
+        },
+        {
+            "name": "ClassSessionPolicy",
+            "abilities": {
+                "view(user, session)": "admin -> always true; teacher -> session.timetable.teacher.user_id == user.id; student -> session.timetable.batch_id == user.student.batch_id; hod -> session.timetable.batch.program.department_id == user.teacher.department_id; anyone else -> false",
+                "end(user, session)": "user.isTeacher() AND session.timetable.teacher.user_id == user.id"
+            },
+            "used_by": [
+                "GET /api/sessions/{session}",
+                "GET /api/sessions/{session}/attendance",
+                "POST /api/sessions/{session}/end"
+            ]
+        },
+        {
+            "name": "StudentPolicy",
+            "abilities": {
+                "block(user, student)": "user.isTeacher() AND a Timetable row exists with teacher_id=user.teacher.id AND batch_id=student.batch_id",
+                "unblock(user, student)": "identical rule to block"
+            },
+            "used_by": [
+                "POST /api/students/{student}/block",
+                "POST /api/students/{student}/unblock"
+            ]
+        },
+        {
+            "name": "NotificationPolicy",
+            "abilities": {
+                "view(user, notification)": "notification.user_id == user.id",
+                "delete(user, notification)": "notification.user_id == user.id"
+            },
+            "used_by": [
+                "PUT /api/notifications/{id}/read",
+                "DELETE /api/notifications/{id}"
+            ]
+        }
+    ],
+    "middleware": [
+        {
+            "name": "auth:sanctum",
+            "source": "Laravel Sanctum built-in",
+            "purpose": "Requires a valid Bearer token in the Authorization header, resolved against personal_access_tokens. Returns 401 {\"message\":\"Unauthenticated.\"} if missing/invalid.",
+            "applied_to": "Every /api route except POST /auth/register and POST /auth/login"
+        },
+        {
+            "name": "role:{role1},{role2}...",
+            "source": "app/Http/Middleware/EnsureUserHasRole.php",
+            "alias_registered_in": "bootstrap/app.php as 'role'",
+            "purpose": "Checks $request->user()->role against the comma-separated list of allowed roles passed as middleware parameters (e.g. role:admin or role:admin,hod). Returns 403 {\"message\":\"You do not have permission to perform this action.\"} if the user's role isn't in the list.",
+            "note": "Always stacked AFTER auth:sanctum in the route group, so an unauthenticated request gets 401 (from auth:sanctum) before ever reaching this check."
+        },
+        {
+            "name": "(API rate limiter)",
+            "source": "AppServiceProvider::boot — RateLimiter::for('api', ...)",
+            "purpose": "60 requests/minute, keyed by authenticated user id or, if unauthenticated, by IP address."
+        }
+    ],
+    "routes": {
+        "total_count": 57,
+        "grouped_by": {
+            "Auth": [
+                "POST /api/auth/register (public)",
+                "POST /api/auth/login (public)",
+                "POST /api/auth/logout (auth:sanctum)",
+                "GET /api/auth/user (auth:sanctum)"
+            ],
+            "Admin": [
+                "GET|POST /api/departments, GET|PUT /api/departments/{department}",
+                "GET|POST /api/programs, GET|PUT /api/programs/{program}",
+                "GET|POST /api/program-courses, GET|PUT /api/program-courses/{programCourse}",
+                "GET|POST /api/batches, GET|PUT /api/batches/{batch}",
+                "GET|POST /api/rooms, GET|PUT /api/rooms/{room}",
+                "GET|POST /api/time-slots",
+                "GET|POST /api/teachers, GET|PUT /api/teachers/{teacher}",
+                "GET|POST /api/students, GET|PUT /api/students/{student}",
+                "GET|POST /api/timetables, GET|PUT /api/timetables/{timetable}",
+                "GET /api/dashboard/admin"
+            ],
+            "Teacher": [
+                "POST /api/students/{student}/block",
+                "POST /api/students/{student}/unblock",
+                "POST /api/sessions/{timetable}/start",
+                "POST /api/sessions/{session}/end",
+                "GET /api/sessions/{session}/attendance",
+                "GET /api/attendance/report",
+                "GET /api/dashboard/teacher"
+            ],
+            "Student": [
+                "GET /api/students/today-classes",
+                "GET /api/students/schedule",
+                "GET /api/students/attendance-history",
+                "POST /api/attendance/mark",
+                "GET /api/dashboard/student"
+            ],
+            "HOD": [
+                "GET /api/dashboard/hod"
+            ],
+            "Shared": [
+                "GET /api/sessions",
+                "GET /api/sessions/{session}",
+                "GET /api/notifications",
+                "PUT /api/notifications/{notification}/read",
+                "DELETE /api/notifications/{notification}"
+            ]
+        },
+        "route_ordering_note": "Student-only literal paths (students/today-classes, students/schedule, students/attendance-history) are registered BEFORE the admin GET /students/{student} wildcard route in routes/api.php — this is required, since Laravel matches routes in registration order and the wildcard would otherwise swallow those literal paths as an invalid {student} id lookup."
+    },
+    "environment": {
+        "required": {
+            "APP_NAME": "University WiFi Attendance",
+            "APP_ENV": "production (local for dev)",
+            "APP_KEY": "base64: generated via php artisan key:generate",
+            "APP_DEBUG": "false in production (true shows full stack traces in error JSON — must be false for clean error responses)",
+            "APP_URL": "public URL the API is served from, e.g. https://api.your-domain.com",
+            "DB_CONNECTION": "mysql",
+            "DB_HOST": "MySQL host",
+            "DB_PORT": "3306",
+            "DB_DATABASE": "database name",
+            "DB_USERNAME": "db user",
+            "DB_PASSWORD": "db password",
+            "SESSION_DRIVER": "database (framework-level only, irrelevant to the token API auth)",
+            "CACHE_STORE": "database",
+            "QUEUE_CONNECTION": "database"
+        },
+        "optional": {
+            "BCRYPT_ROUNDS": "12 (password hashing cost)",
+            "LOG_CHANNEL": "stack",
+            "LOG_LEVEL": "debug locally / error or warning in production",
+            "MAIL_*": "not used by any current feature (no email notifications implemented)",
+            "SANCTUM_STATEFUL_DOMAINS": "irrelevant for this project — no SPA cookie auth is configured, only Bearer tokens"
+        },
+        "not_required": [
+            "Any VITE_* variable — the frontend (Flutter) is a separate app and does not consume Laravel Mix/Vite assets",
+            "REDIS_* — Redis is not configured as the active driver for cache/session/queue"
+        ]
+    },
+    "deployment": {
+        "platform": "Coolify, building the app from the repository's Dockerfile",
+        "dockerfile_summary": {
+            "base_image": "php:8.3-cli",
+            "extensions_installed": [
+                "pdo",
+                "pdo_mysql",
+                "zip"
+            ],
+            "build_steps": [
+                "copy composer binary from the official composer:2 image",
+                "copy full app source",
+                "composer install --no-dev --optimize-autoloader",
+                "config:clear, cache:clear, route:clear, view:clear (each suffixed with '|| true' so a clear failure doesn't fail the build)"
+            ],
+            "exposed_port": 8000,
+            "start_command": "php artisan serve --host=0.0.0.0 --port=8000",
+            "caveat": "artisan serve is Laravel's single-threaded development server — it is not the recommended production web server (no nginx/php-fpm/Octane in front of it). It works for moderate traffic but won't handle concurrent requests as efficiently as a real FPM+nginx stack. Acceptable for an MVP/small deployment; worth revisiting if load increases.",
+            "migrations": "The Dockerfile does NOT run php artisan migrate — migrations must be run manually (e.g. via a Coolify post-deploy command/hook or a one-off `php artisan migrate --force` exec into the running container) after each deploy that includes schema changes."
+        },
+        "frontend_assets": "None — package.json, vite.config.js, resources/js, resources/css and the default Blade welcome view were all removed; the project is a pure JSON API. GET / returns {\"status\":\"ok\",\"service\":\"...\"} for a basic health check, separate from the Laravel health-check route at GET /up.",
+        "sanctum": {
+            "mode": "Token-based only (personal access tokens via Bearer header) — NOT the SPA stateful-cookie mode. No CORS/stateful-domain configuration is needed for a Flutter mobile client; that machinery only matters for browser-based SPA frontends sharing a cookie domain with the API.",
+            "token_lifetime": "Indefinite (sanctum.expiration = null) — tokens never auto-expire and must be explicitly revoked via POST /api/auth/logout."
+        },
+        "mysql": {
+            "requirement": "A reachable MySQL instance (8.0+ recommended) configured via the DB_* env vars. Not bundled in the Dockerfile — must be provisioned separately in Coolify (or pointed at an external managed MySQL).",
+            "migrations_to_run": "19 migration files covering the 14 domain tables plus Sanctum's personal_access_tokens and Laravel's framework tables (cache, jobs, sessions, password_reset_tokens)."
+        }
+    },
+    "flutter_integration": {
+        "authentication_flow": [
+            "1. Call POST /api/auth/login with {email, password}.",
+            "2. On 200, store data.token and data.user (especially user.role) — this token is the permanent credential for this device/session, there is no refresh-token flow.",
+            "3. On 422 (bad credentials) or 403 (inactive account), show the message field directly to the user.",
+            "4. For every subsequent request, attach header Authorization: Bearer {token}.",
+            "5. Call GET /api/auth/user on app startup (if a token is already stored) to verify it's still valid and refresh the cached user/role before deciding which home screen to show — don't trust a long-cached role blindly, since an admin could change it server-side."
+        ],
+        "token_storage": "Use flutter_secure_storage (Keychain on iOS, EncryptedSharedPreferences on Android) — never plain SharedPreferences, since this Bearer token has no expiration and is equivalent to a permanent password for that account until logout.",
+        "role_based_navigation": {
+            "rule": "After login/auth-check, branch the app's home route purely on user.role: admin, hod, teacher, student. Each role's home screen should only call its own role's endpoints — calling a role-gated endpoint with the wrong role gets a 403 immediately, not a partial/filtered response.",
+            "hod_caveat": "HOD's only role-specific endpoint is GET /api/dashboard/hod. If the HOD home screen needs teacher/student lists, those endpoints don't exist server-side yet — coordinate with the backend dev before building that screen, or scope the HOD UI to dashboard + shared sessions/notifications only for now."
+        },
+        "api_calling_sequence": "Every protected call needs both headers: Authorization: Bearer {token} and Accept: application/json (the latter ensures Laravel renders JSON error pages instead of HTML even on unexpected 500s, since bootstrap/app.php's shouldRenderJsonWhen checks request->is('api/*'), but Accept:application/json is still good practice for content negotiation).",
+        "error_handling": {
+            "401": "{\"message\":\"Unauthenticated.\"} — token missing/invalid/revoked. Force the user back to the login screen and discard the stored token.",
+            "403_role_middleware": "{\"message\":\"You do not have permission to perform this action.\"} — wrong role for this route entirely.",
+            "403_policy": "{\"message\":\"This action is unauthorized.\"} — right role, but failed an ownership check (e.g. a teacher trying to end another teacher's session). Laravel's default AuthorizationException message — generic, not endpoint-specific.",
+            "404": "{\"message\":\"No query results for model [App\\\\Models\\\\X] {id}\"} — Eloquent's default not-found message, leaks the model class name. Treat any 404 as 'not found', don't try to parse the message for UI text.",
+            "409": "{\"message\":\"...\"} — domain conflict (duplicate session, already blocked, already marked, schedule clash). These ARE meant to be shown to the user as-is; the message text is written for end users.",
+            "422_validation": "{\"message\":\"summary\", \"errors\": {\"field\": [\"reason\"]}} — map the errors object to per-field form messages.",
+            "422_business": "{\"message\":\"...\"} (no errors key) — domain-rule rejection (session not active, WiFi mismatch). Distinguish from validation 422 by checking whether 'errors' key is present.",
+            "500_in_debug_mode": "If APP_DEBUG=true server-side, error responses include a full stack trace JSON instead of a clean {message}. This must NOT happen in production — confirm APP_DEBUG=false is set before shipping, or the Flutter error handler will receive unpredictable shapes on server errors."
+        },
+        "pagination": {
+            "current_reality": "See api_endpoints.pagination_note — list endpoints call ->paginate(15) server-side but the response only contains data: [...] as a flat array, with NO meta/links/total/current_page/last_page fields. The client cannot currently tell whether more pages exist.",
+            "recommendation_for_now": "Until the backend is fixed to expose pagination metadata, the Flutter client should not build page-number/infinite-scroll UI against these endpoints — treat each list response as 'the first/only page' or coordinate a backend fix first."
+        },
+        "notifications": {
+            "delivery_mechanism": "Pull-based only — there is no push notification (FCM/APNs) integration and no WebSocket/broadcast channel. The Flutter app must poll GET /api/notifications to discover new notifications (e.g. on app resume, or a periodic timer).",
+            "unread_badge": "Filter client-side on is_read == false from the GET /api/notifications list (there's no separate unread-count or unread-only endpoint).",
+            "marking_read": "PUT /api/notifications/{id}/read individually — there is no mark-all-as-read endpoint."
+        }
+    }
+}

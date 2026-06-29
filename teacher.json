@@ -1,0 +1,742 @@
+{
+  "note": "Teacher-related API endpoints after the recent changes: (1) department_id is now optional when registering/creating a teacher, because one teacher can be assigned courses across multiple departments via the timetable instead of being locked to a single department; (2) teacher/student profile is auto-created on self-register; (3) dashboard + schedule responses now include full nested department/program/batch/timing info; (4) missing-profile crashes now return a clean 404 instead of a 500.",
+
+  "1_register_teacher": {
+    "method": "POST",
+    "url": "/api/auth/register",
+    "auth_required": false,
+    "request_body": {
+      "name": "Bilal Ahmed",
+      "email": "bilal.ahmed2@university.edu",
+      "password": "password123",
+      "password_confirmation": "password123",
+      "role": "teacher",
+      "employee_no": "T-100",
+      "designation": "Lecturer",
+      "phone": "0300-1234567"
+    },
+    "request_notes": "department_id is NOT required for role=teacher anymore. You may still send it if you want to set a home department, but it can be omitted entirely.",
+    "success_response": {
+      "status": 201,
+      "body": {
+        "message": "Registration successful",
+        "data": {
+          "user": {
+            "id": 28,
+            "name": "Bilal Ahmed",
+            "email": "bilal.ahmed2@university.edu",
+            "role": "teacher",
+            "status": "active",
+            "created_at": "2026-06-29T08:10:00.000000Z"
+          },
+          "token": "14|nQwErTyUiOpAsDfGhJkLzXcVbNm1234567890"
+        }
+      }
+    },
+    "error_response_validation": {
+      "status": 422,
+      "body": {
+        "message": "The employee no has already been taken.",
+        "errors": {
+          "employee_no": ["The employee no has already been taken."]
+        }
+      }
+    }
+  },
+
+  "2_register_hod": {
+    "method": "POST",
+    "url": "/api/auth/register",
+    "auth_required": false,
+    "request_body": {
+      "name": "Dr. Imran Sheikh",
+      "email": "imran.sheikh2@university.edu",
+      "password": "password123",
+      "password_confirmation": "password123",
+      "role": "hod",
+      "department_id": 1,
+      "employee_no": "T-101",
+      "designation": "Professor",
+      "phone": "0300-7654321"
+    },
+    "request_notes": "department_id IS required for role=hod, because the HOD dashboard is scoped to one specific department.",
+    "success_response": {
+      "status": 201,
+      "body": {
+        "message": "Registration successful",
+        "data": {
+          "user": {
+            "id": 29,
+            "name": "Dr. Imran Sheikh",
+            "email": "imran.sheikh2@university.edu",
+            "role": "hod",
+            "status": "active",
+            "created_at": "2026-06-29T08:11:00.000000Z"
+          },
+          "token": "15|aBcDeFgHiJkLmNoPqRsTuVwXyZ0987654321"
+        }
+      }
+    }
+  },
+
+  "3_login": {
+    "method": "POST",
+    "url": "/api/auth/login",
+    "auth_required": false,
+    "request_body": {
+      "email": "bilal.ahmed2@university.edu",
+      "password": "password123"
+    },
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Login successful",
+        "data": {
+          "user": {
+            "id": 28,
+            "name": "Bilal Ahmed",
+            "email": "bilal.ahmed2@university.edu",
+            "role": "teacher",
+            "status": "active",
+            "created_at": "2026-06-29T08:10:00.000000Z"
+          },
+          "token": "16|ZxYwVuTsRqPoNmLkJiHgFeDcBa1122334455"
+        }
+      }
+    },
+    "error_response": {
+      "status": 422,
+      "body": {
+        "message": "The provided credentials are incorrect.",
+        "errors": {
+          "email": ["The provided credentials are incorrect."]
+        }
+      }
+    }
+  },
+
+  "4_teacher_dashboard": {
+    "method": "GET",
+    "url": "/api/dashboard/teacher",
+    "auth_required": true,
+    "headers": {
+      "Authorization": "Bearer {teacher_token}"
+    },
+    "success_response_with_classes": {
+      "status": 200,
+      "body": {
+        "message": "Success",
+        "data": {
+          "today_classes": [
+            {
+              "id": 3,
+              "batch_id": 1,
+              "program_course_id": 2,
+              "teacher_id": 9,
+              "room_id": 1,
+              "day": "Monday",
+              "slot_id": 1,
+              "batch": {
+                "id": 1,
+                "program_id": 1,
+                "batch_name": "BSCS-2023-M",
+                "start_year": 2023,
+                "end_year": 2027,
+                "semester": 3,
+                "shift": "Morning",
+                "program": {
+                  "id": 1,
+                  "department_id": 1,
+                  "name": "BS Computer Science",
+                  "code": "BSCS",
+                  "department": {
+                    "id": 1,
+                    "name": "Computer Science",
+                    "hod_teacher_id": 1,
+                    "created_at": "..."
+                  }
+                }
+              },
+              "course": {
+                "id": 2,
+                "program_id": 1,
+                "course_code": "CS102",
+                "course_title": "Data Structures",
+                "credit_hours": 3,
+                "program": {
+                  "id": 1,
+                  "department_id": 1,
+                  "name": "BS Computer Science",
+                  "code": "BSCS",
+                  "department": {
+                    "id": 1,
+                    "name": "Computer Science"
+                  }
+                }
+              },
+              "teacher": {
+                "id": 9,
+                "user_id": 28,
+                "department_id": null,
+                "employee_no": "T-100",
+                "designation": "Lecturer",
+                "phone": "0300-1234567",
+                "is_hod": false,
+                "name": "Bilal Ahmed",
+                "email": "bilal.ahmed2@university.edu",
+                "status": "active"
+              },
+              "room": {
+                "id": 1,
+                "room_no": "Room-101",
+                "wifi_name": "Lab-WiFi-101",
+                "wifi_mac": "AA:BB:CC:00:01:01"
+              },
+              "time_slot": {
+                "id": 1,
+                "start_time": "08:00",
+                "end_time": "09:00"
+              },
+              "created_at": "..."
+            }
+          ],
+          "today_classes_count": 1,
+          "today_sessions_started": 0
+        }
+      }
+    },
+    "success_response_no_classes": {
+      "status": 200,
+      "body": {
+        "message": "Success",
+        "data": {
+          "today_classes": [],
+          "today_classes_count": 0,
+          "today_sessions_started": 0
+        }
+      },
+      "note": "today_classes_count: 0 means no class assigned for today — show 'No class assigned' on the frontend instead of treating this as an error."
+    },
+    "error_response_no_profile": {
+      "status": 404,
+      "body": {
+        "message": "No teacher profile is linked to this account. Please contact the administrator."
+      },
+      "note": "Happens only if the logged-in account has role=teacher but no row in the teachers table (shouldn't happen anymore after the register fix, but kept as a safety net)."
+    }
+  },
+
+  "5_teacher_full_schedule": {
+    "method": "GET",
+    "url": "/api/teacher/schedule",
+    "auth_required": true,
+    "headers": {
+      "Authorization": "Bearer {teacher_token}"
+    },
+    "description": "New endpoint - returns the teacher's ENTIRE weekly timetable (every day, not just today), grouped by day.",
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Success",
+        "data": {
+          "Monday": [
+            {
+              "id": 3,
+              "day": "Monday",
+              "batch": { "batch_name": "BSCS-2023-M", "semester": 3, "shift": "Morning", "program": { "name": "BS Computer Science", "department": { "name": "Computer Science" } } },
+              "course": { "course_code": "CS102", "course_title": "Data Structures" },
+              "room": { "room_no": "Room-101" },
+              "time_slot": { "start_time": "08:00", "end_time": "09:00" }
+            }
+          ],
+          "Thursday": [
+            {
+              "id": 7,
+              "day": "Thursday",
+              "batch": { "batch_name": "BSCS-2023-M", "semester": 3, "shift": "Morning", "program": { "name": "BS Computer Science", "department": { "name": "Computer Science" } } },
+              "course": { "course_code": "CS202", "course_title": "Computer Networks" },
+              "room": { "room_no": "Room-102" },
+              "time_slot": { "start_time": "09:00", "end_time": "10:00" }
+            }
+          ]
+        }
+      },
+      "note": "Object is grouped by day name. A day with no class simply won't be a key in this object — empty object {} means no classes assigned at all yet."
+    }
+  },
+
+  "6_admin_creates_teacher": {
+    "method": "POST",
+    "url": "/api/teachers",
+    "auth_required": true,
+    "headers": {
+      "Authorization": "Bearer {admin_token}"
+    },
+    "request_body": {
+      "name": "Sara Malik",
+      "email": "sara.malik2@university.edu",
+      "password": "password123",
+      "password_confirmation": "password123",
+      "department_id": null,
+      "employee_no": "T-102",
+      "designation": "Assistant Professor",
+      "phone": "0300-9988776"
+    },
+    "request_notes": "department_id can be null/omitted now (admin endpoint), since the same teacher can later be assigned classes in any department via timetables.",
+    "success_response": {
+      "status": 201,
+      "body": {
+        "message": "Teacher created",
+        "data": {
+          "id": 9,
+          "user_id": 28,
+          "department_id": null,
+          "employee_no": "T-102",
+          "designation": "Assistant Professor",
+          "phone": "0300-9988776",
+          "is_hod": false,
+          "name": "Sara Malik",
+          "email": "sara.malik2@university.edu",
+          "status": "active",
+          "department": null,
+          "created_at": "..."
+        }
+      }
+    }
+  },
+
+  "7_admin_assigns_class_to_teacher": {
+    "method": "POST",
+    "url": "/api/timetables",
+    "auth_required": true,
+    "headers": {
+      "Authorization": "Bearer {admin_token}"
+    },
+    "description": "This is how a teacher actually gets a class to teach. Admin picks an existing batch_id, program_course_id, room_id, slot_id, and assigns teacher_id.",
+    "request_body": {
+      "batch_id": 1,
+      "program_course_id": 2,
+      "teacher_id": 9,
+      "room_id": 1,
+      "day": "Wednesday",
+      "slot_id": 2
+    },
+    "success_response": {
+      "status": 201,
+      "body": {
+        "message": "Timetable created",
+        "data": {
+          "id": 11,
+          "batch_id": 1,
+          "program_course_id": 2,
+          "teacher_id": 9,
+          "room_id": 1,
+          "day": "Wednesday",
+          "slot_id": 2,
+          "batch": { "batch_name": "BSCS-2023-M", "semester": 3, "shift": "Morning" },
+          "course": { "course_code": "CS102", "course_title": "Data Structures" },
+          "teacher": { "name": "Sara Malik", "employee_no": "T-102" },
+          "room": { "room_no": "Room-101" },
+          "time_slot": { "start_time": "09:00", "end_time": "10:00" },
+          "created_at": "..."
+        }
+      }
+    },
+    "error_response_conflict": {
+      "status": 422,
+      "body": {
+        "message": "This teacher, room, or batch already has a class scheduled at this day and time slot."
+      }
+    },
+    "after_this": "Once this timetable row exists, GET /api/dashboard/teacher and GET /api/teacher/schedule for Sara Malik (teacher_id 9) will immediately show this class with full department/program/batch/timing details."
+  },
+
+  "8_start_session": {
+    "method": "POST",
+    "url": "/api/sessions/{timetable}/start",
+    "url_example": "/api/sessions/3/start",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {teacher_token}" },
+    "description": "Teacher starts attendance for one of their OWN scheduled classes (timetable id, not session id). Server auto-creates an 'absent' attendance row for every student in that batch, then notifies them to connect to the room's WiFi.",
+    "request_body": null,
+    "success_response": {
+      "status": 201,
+      "body": {
+        "message": "Session started",
+        "data": {
+          "id": 14,
+          "timetable_id": 3,
+          "session_date": "2026-06-29",
+          "start_time": "08:00:00",
+          "end_time": "09:00:00",
+          "status": "active",
+          "present_count": 0,
+          "absent_count": 8,
+          "student_count": 8,
+          "created_at": "2026-06-29T08:00:05.000000Z"
+        }
+      }
+    },
+    "error_response_not_owner": {
+      "status": 403,
+      "body": { "message": "This action is unauthorized." },
+      "note": "Happens if you try to start a timetable that belongs to a different teacher (TimetablePolicy::start)."
+    },
+    "error_response_already_active": {
+      "status": 409,
+      "body": { "message": "A session for this class is already active today." }
+    }
+  },
+
+  "9_end_session": {
+    "method": "POST",
+    "url": "/api/sessions/{session}/end",
+    "url_example": "/api/sessions/14/end",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {teacher_token}" },
+    "description": "Ends an active session (session id from step 8's response, NOT the timetable id). Marks remaining students absent-notified and notifies the teacher with a present/absent summary.",
+    "request_body": null,
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Session ended",
+        "data": {
+          "id": 14,
+          "timetable_id": 3,
+          "session_date": "2026-06-29",
+          "start_time": "08:00:00",
+          "end_time": "09:00:00",
+          "status": "ended",
+          "present_count": 5,
+          "absent_count": 3,
+          "student_count": 8,
+          "created_at": "2026-06-29T08:00:05.000000Z"
+        }
+      }
+    },
+    "error_response_not_active": {
+      "status": 409,
+      "body": { "message": "This session is not active." }
+    },
+    "error_response_not_owner": {
+      "status": 403,
+      "body": { "message": "This action is unauthorized." }
+    }
+  },
+
+  "10_session_attendance_detail": {
+    "method": "GET",
+    "url": "/api/sessions/{session}/attendance",
+    "url_example": "/api/sessions/14/attendance",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {teacher_token}" },
+    "description": "Full per-student attendance breakdown for one session (active or ended).",
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Success",
+        "data": {
+          "session": {
+            "id": 14,
+            "timetable_id": 3,
+            "session_date": "2026-06-29",
+            "start_time": "08:00:00",
+            "end_time": "09:00:00",
+            "status": "ended"
+          },
+          "present_count": 5,
+          "absent_count": 3,
+          "students": [
+            {
+              "id": 101,
+              "session_id": 14,
+              "student_id": 1,
+              "wifi_mac_detected": "AA:BB:CC:00:01:01",
+              "status": "present",
+              "marked_at": "2026-06-29T08:02:11.000000Z",
+              "student": {
+                "id": 1,
+                "registration_no": "CS-23-001",
+                "name": "BSCS Student 1",
+                "email": "bscs.student1@university.edu",
+                "is_blocked": false
+              }
+            },
+            {
+              "id": 102,
+              "session_id": 14,
+              "student_id": 2,
+              "wifi_mac_detected": null,
+              "status": "absent",
+              "marked_at": null,
+              "student": {
+                "id": 2,
+                "registration_no": "CS-23-002",
+                "name": "BSCS Student 2",
+                "email": "bscs.student2@university.edu",
+                "is_blocked": false
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+
+  "11_block_student": {
+    "method": "POST",
+    "url": "/api/students/{student}/block",
+    "url_example": "/api/students/2/block",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {teacher_token}" },
+    "description": "Blocks a student from marking attendance. Only allowed if the teacher actually teaches that student's batch (checked via timetables).",
+    "request_body": null,
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Student blocked",
+        "data": {
+          "id": 2,
+          "user_id": 15,
+          "registration_no": "CS-23-002",
+          "department_id": 1,
+          "batch_id": 1,
+          "phone": "0300-1112233",
+          "is_blocked": true,
+          "blocked_at": "2026-06-29T08:30:00.000000Z",
+          "name": "BSCS Student 2",
+          "email": "bscs.student2@university.edu",
+          "status": "active",
+          "created_at": "..."
+        }
+      }
+    },
+    "error_response_not_your_student": {
+      "status": 403,
+      "body": { "message": "You do not teach this student's batch." }
+    },
+    "error_response_already_blocked": {
+      "status": 409,
+      "body": { "message": "Student is already blocked." }
+    }
+  },
+
+  "12_unblock_student": {
+    "method": "POST",
+    "url": "/api/students/{student}/unblock",
+    "url_example": "/api/students/2/unblock",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {teacher_token}" },
+    "request_body": null,
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Student unblocked",
+        "data": {
+          "id": 2,
+          "is_blocked": false,
+          "blocked_at": null,
+          "name": "BSCS Student 2",
+          "email": "bscs.student2@university.edu"
+        }
+      }
+    },
+    "error_response_not_blocked": {
+      "status": 409,
+      "body": { "message": "Student is not blocked." }
+    }
+  },
+
+  "13_attendance_report": {
+    "method": "GET",
+    "url": "/api/attendance/report",
+    "url_with_filters_example": "/api/attendance/report?batch_id=1&course_id=2&date=2026-06-29&per_page=15",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {teacher_token}" },
+    "description": "Paginated attendance history across all of the teacher's OWN sessions. All query params are optional filters.",
+    "query_params": {
+      "course_id": "nullable|integer|exists:program_courses,id",
+      "batch_id": "nullable|integer|exists:batches,id",
+      "date": "nullable|date (YYYY-MM-DD)",
+      "per_page": "nullable|integer|min:1|max:100 (default 15)"
+    },
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Success",
+        "data": [
+          {
+            "id": 101,
+            "session_id": 14,
+            "student_id": 1,
+            "wifi_mac_detected": "AA:BB:CC:00:01:01",
+            "status": "present",
+            "marked_at": "2026-06-29T08:02:11.000000Z",
+            "student": {
+              "id": 1,
+              "registration_no": "CS-23-001",
+              "name": "BSCS Student 1"
+            },
+            "session": {
+              "id": 14,
+              "session_date": "2026-06-29",
+              "status": "ended",
+              "timetable": {
+                "course": { "course_code": "CS102", "course_title": "Data Structures" }
+              }
+            }
+          }
+        ]
+      },
+      "known_gap": "This list is paginated server-side (15 per page) but the response does not include pagination meta (current_page/last_page/total) — only the flat array of items is returned in 'data'."
+    }
+  },
+
+  "14_sessions_list_shared": {
+    "method": "GET",
+    "url": "/api/sessions",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {teacher_token}" },
+    "description": "Shared endpoint for every role, but automatically scoped: a teacher only ever sees sessions for their OWN timetables (SessionController::index, teacher_id filter).",
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Success",
+        "data": [
+          {
+            "id": 14,
+            "timetable_id": 3,
+            "session_date": "2026-06-29",
+            "start_time": "08:00:00",
+            "end_time": "09:00:00",
+            "status": "ended",
+            "timetable": {
+              "id": 3,
+              "day": "Monday",
+              "course": { "course_code": "CS102", "course_title": "Data Structures" },
+              "batch": { "batch_name": "BSCS-2023-M" },
+              "room": { "room_no": "Room-101" },
+              "teacher": { "name": "Bilal Ahmed" }
+            },
+            "created_at": "..."
+          }
+        ]
+      }
+    }
+  },
+
+  "15_session_show_shared": {
+    "method": "GET",
+    "url": "/api/sessions/{session}",
+    "url_example": "/api/sessions/14",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {teacher_token}" },
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Success",
+        "data": {
+          "id": 14,
+          "timetable_id": 3,
+          "session_date": "2026-06-29",
+          "status": "ended",
+          "present_count": 5,
+          "absent_count": 3,
+          "student_count": 8,
+          "timetable": { "...": "TimetableResource, fully nested" }
+        }
+      }
+    },
+    "error_response_not_owner": {
+      "status": 403,
+      "body": { "message": "This action is unauthorized." }
+    }
+  },
+
+  "16_notifications_list_shared": {
+    "method": "GET",
+    "url": "/api/notifications",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {teacher_token}" },
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Success",
+        "data": [
+          {
+            "id": 9,
+            "title": "Session Ended",
+            "message": "Session ended: 5 present, 3 absent.",
+            "type": "session_ended",
+            "related_data": { "session_id": 14, "present": 5, "absent": 3 },
+            "is_read": false,
+            "created_at": "2026-06-29T09:00:10.000000Z"
+          }
+        ]
+      }
+    }
+  },
+
+  "17_notification_mark_read_shared": {
+    "method": "PUT",
+    "url": "/api/notifications/{notification}/read",
+    "url_example": "/api/notifications/9/read",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {teacher_token}" },
+    "request_body": null,
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Notification marked as read",
+        "data": { "id": 9, "is_read": true }
+      }
+    }
+  },
+
+  "18_notification_delete_shared": {
+    "method": "DELETE",
+    "url": "/api/notifications/{notification}",
+    "url_example": "/api/notifications/9",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {teacher_token}" },
+    "success_response": {
+      "status": 200,
+      "body": { "message": "Notification deleted", "data": null }
+    }
+  },
+
+  "19_logout_shared": {
+    "method": "POST",
+    "url": "/api/auth/logout",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {teacher_token}" },
+    "request_body": null,
+    "success_response": {
+      "status": 200,
+      "body": { "message": "Logged out successfully", "data": null }
+    },
+    "note": "Only revokes the current device's token, other logged-in devices for the same teacher stay logged in."
+  },
+
+  "20_get_authenticated_user_shared": {
+    "method": "GET",
+    "url": "/api/auth/user",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {teacher_token}" },
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Authenticated user",
+        "data": {
+          "id": 28,
+          "name": "Bilal Ahmed",
+          "email": "bilal.ahmed2@university.edu",
+          "role": "teacher",
+          "status": "active",
+          "created_at": "2026-06-29T08:10:00.000000Z"
+        }
+      }
+    },
+    "note": "Best endpoint to call after login/app-resume to confirm current role/status — always reflects live DB state."
+  }
+}

@@ -21,9 +21,9 @@ class SessionController extends Controller
         $query = ClassSession::with(['timetable.course', 'timetable.room', 'timetable.batch', 'timetable.teacher.user']);
 
         if ($user->isTeacher()) {
-            $query->whereHas('timetable', fn ($q) => $q->where('teacher_id', $user->teacher->id));
+            $query->whereHas('timetable', fn ($q) => $q->where('teacher_id', $user->teacher?->id));
         } elseif ($user->isStudent()) {
-            $query->whereHas('timetable', fn ($q) => $q->where('batch_id', $user->student->batch_id));
+            $query->whereHas('timetable', fn ($q) => $q->where('batch_id', $user->student?->batch_id));
         } elseif ($user->isHod()) {
             $query->whereHas('timetable.batch.program', fn ($q) => $q->where('department_id', $user->teacher?->department_id));
         }

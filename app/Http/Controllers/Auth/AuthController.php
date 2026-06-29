@@ -7,6 +7,8 @@ use App\Http\Requests\Auth\LoginRequest;
 use App\Http\Requests\Auth\RegisterRequest;
 use App\Http\Resources\UserResource;
 use App\Models\User;
+use App\Services\StudentService;
+use App\Services\TeacherService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -14,9 +16,21 @@ use Illuminate\Validation\ValidationException;
 
 class AuthController extends Controller
 {
+    public function __construct(
+        private TeacherService $teachers,
+        private StudentService $students,
+    ) {}
+
     public function register(RegisterRequest $request): JsonResponse
     {
-        $user = User::create([...$request->validated(), 'status' => 'active']);
+        $data = $request->validated();
+
+        $user = match ($data['role']) {
+            'teacher' => $this->teachers->create($data)->user,
+            'hod' => $this->teachers->create($data, 'hod')->user,
+            'student' => $this->students->create($data)->user,
+            default => User::create(['name' => $data['name'], 'email' => $data['email'], 'password' => $data['password'], 'role' => $data['role']]),
+        };
 
         $token = $user->createToken('api-token')->plainTextToken;
 

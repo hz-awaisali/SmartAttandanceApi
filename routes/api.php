@@ -15,6 +15,7 @@ use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\SessionController;
 use App\Http\Controllers\Student\ScheduleController;
+use App\Http\Controllers\Teacher\ScheduleController as TeacherScheduleController;
 use App\Http\Controllers\Teacher\StudentBlockController;
 use Illuminate\Support\Facades\Route;
 
@@ -48,6 +49,7 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('sessions/{session}/attendance', [SessionController::class, 'attendance']);
         Route::get('attendance/report', [AttendanceController::class, 'report']);
         Route::get('dashboard/teacher', [DashboardController::class, 'teacher']);
+        Route::get('teacher/schedule', [TeacherScheduleController::class, 'schedule']);
     });
 
     Route::middleware('role:admin')->group(function () {

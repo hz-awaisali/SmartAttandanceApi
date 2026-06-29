@@ -63,11 +63,16 @@ class DashboardService
     public function teacher(User $user): array
     {
         $teacher = $user->teacher;
+
+        if (! $teacher) {
+            throw new BusinessException('No teacher profile is linked to this account. Please contact the administrator.', 404);
+        }
+
         $todayName = now()->format('l');
 
         $todayTimetables = Timetable::where('teacher_id', $teacher->id)
             ->where('day', $todayName)
-            ->with(['course', 'room', 'timeSlot', 'batch'])
+            ->with(['course.program.department', 'room', 'timeSlot', 'batch.program.department'])
             ->get();
 
         $todaySessionsStarted = ClassSession::whereDate('session_date', today())
@@ -84,6 +89,11 @@ class DashboardService
     public function student(User $user): array
     {
         $student = $user->student;
+
+        if (! $student) {
+            throw new BusinessException('No student profile is linked to this account. Please contact the administrator.', 404);
+        }
+
         $todayName = now()->format('l');
 
         $todayClassesCount = Timetable::where('batch_id', $student->batch_id)
