@@ -8,12 +8,16 @@ use App\Http\Requests\Program\UpdateProgramRequest;
 use App\Http\Resources\ProgramResource;
 use App\Models\Program;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 
 class ProgramController extends Controller
 {
-    public function index(): JsonResponse
+    public function index(Request $request): JsonResponse
     {
-        $programs = Program::with('department')->latest()->paginate(15);
+        $programs = Program::with('department')
+            ->when($request->filled('department_id'), fn ($query) => $query->where('department_id', $request->department_id))
+            ->latest()
+            ->paginate(15);
 
         return $this->ok(ProgramResource::collection($programs));
     }

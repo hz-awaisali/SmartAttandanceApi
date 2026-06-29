@@ -8,12 +8,18 @@ use App\Http\Requests\Batch\UpdateBatchRequest;
 use App\Http\Resources\BatchResource;
 use App\Models\Batch;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 
 class BatchController extends Controller
 {
-    public function index(): JsonResponse
+    public function index(Request $request): JsonResponse
     {
-        $batches = Batch::with('program')->withCount('students')->latest()->paginate(15);
+        $batches = Batch::with('program')
+            ->withCount('students')
+            ->when($request->filled('program_id'), fn ($query) => $query->where('program_id', $request->program_id))
+            ->when($request->filled('department_id'), fn ($query) => $query->whereHas('program', fn ($q) => $q->where('department_id', $request->department_id)))
+            ->latest()
+            ->paginate(15);
 
         return $this->ok(BatchResource::collection($batches));
     }
