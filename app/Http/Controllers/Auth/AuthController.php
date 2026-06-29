@@ -15,8 +15,10 @@ use App\Services\TeacherService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Validation\ValidationException;
+use Throwable;
 
 class AuthController extends Controller
 {
@@ -115,7 +117,18 @@ class AuthController extends Controller
             'verification_code_expires_at' => now()->addMinutes(10),
         ])->save();
 
-        Mail::to($user->email)->send(new VerificationCodeMail($user->name, $code));
+        // The code is already saved either way, so a broken/slow SMTP
+        // connection shouldn't 500 the whole registration/resend request -
+        // the user can still hit "Resend" once mail is reachable again.
+        try {
+            Mail::to($user->email)->send(new VerificationCodeMail($user->name, $code));
+        } catch (Throwable $e) {
+            Log::error('Failed to send verification code email', [
+                'user_id' => $user->id,
+                'email' => $user->email,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     public function logout(Request $request): JsonResponse
