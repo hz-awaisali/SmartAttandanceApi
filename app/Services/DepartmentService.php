@@ -14,7 +14,7 @@ class DepartmentService
             $department = Department::create($data);
 
             if (! empty($data['hod_teacher_id'])) {
-                $this->promoteToHod($data['hod_teacher_id']);
+                $this->promoteToHod($data['hod_teacher_id'], $department->id);
             }
 
             return $department;
@@ -28,13 +28,13 @@ class DepartmentService
 
             $department->update($data);
 
-            if (array_key_exists('hod_teacher_id', $data) && $data['hod_teacher_id'] !== $previousHodTeacherId) {
-                if ($previousHodTeacherId) {
+            if (array_key_exists('hod_teacher_id', $data)) {
+                if ($previousHodTeacherId && $data['hod_teacher_id'] !== $previousHodTeacherId) {
                     $this->demoteFromHod($previousHodTeacherId);
                 }
 
                 if (! empty($data['hod_teacher_id'])) {
-                    $this->promoteToHod($data['hod_teacher_id']);
+                    $this->promoteToHod($data['hod_teacher_id'], $department->id);
                 }
             }
 
@@ -42,9 +42,11 @@ class DepartmentService
         });
     }
 
-    private function promoteToHod(int $teacherId): void
+    private function promoteToHod(int $teacherId, int $departmentId): void
     {
-        Teacher::find($teacherId)?->user?->update(['role' => 'hod']);
+        $teacher = Teacher::find($teacherId);
+        $teacher?->update(['department_id' => $departmentId]);
+        $teacher?->user?->update(['role' => 'hod']);
     }
 
     /**

@@ -1,0 +1,398 @@
+{
+  "note": "HOD (Head of Department) API endpoints. HOD is a distinct role on the users table (role=hod), backed by a row in the teachers table (same as a regular teacher), with teachers.department_id REQUIRED for HOD (unlike teacher, where it's optional). A department's official HOD is whoever departments.hod_teacher_id points to; Teacher::is_hod is just a computed boolean (true if Department::where('hod_teacher_id', $this->id)->exists()). HOD has its own dashboard scoped to their department, and is auto-scoped on the shared /api/sessions endpoints to only see sessions within their department. HOD CANNOT start/end sessions or block/unblock students — those remain teacher-only actions.",
+
+  "1_register_hod": {
+    "method": "POST",
+    "url": "/api/auth/register",
+    "auth_required": false,
+    "request_body": {
+      "name": "Dr. Imran Sheikh",
+      "email": "imran.sheikh2@university.edu",
+      "password": "password123",
+      "password_confirmation": "password123",
+      "role": "hod",
+      "department_id": 1,
+      "employee_no": "T-101",
+      "designation": "Professor",
+      "phone": "0300-7654321"
+    },
+    "request_notes": "department_id IS required for role=hod (unlike role=teacher, where it's optional). This is enforced in RegisterRequest::rules() — 'hod' => required|integer|exists:departments,id. employee_no must also be unique in the teachers table.",
+    "success_response": {
+      "status": 201,
+      "body": {
+        "message": "Registration successful",
+        "data": {
+          "user": {
+            "id": 29,
+            "name": "Dr. Imran Sheikh",
+            "email": "imran.sheikh2@university.edu",
+            "role": "hod",
+            "status": "active",
+            "created_at": "2026-06-29T08:11:00.000000Z"
+          },
+          "token": "15|aBcDeFgHiJkLmNoPqRsTuVwXyZ0987654321"
+        }
+      }
+    },
+    "error_response_missing_department": {
+      "status": 422,
+      "body": {
+        "message": "The department id field is required.",
+        "errors": {
+          "department_id": ["The department id field is required."]
+        }
+      }
+    },
+    "error_response_invalid_department": {
+      "status": 422,
+      "body": {
+        "message": "The selected department id is invalid.",
+        "errors": {
+          "department_id": ["The selected department id is invalid."]
+        }
+      }
+    },
+    "error_response_duplicate_employee_no": {
+      "status": 422,
+      "body": {
+        "message": "The employee no has already been taken.",
+        "errors": {
+          "employee_no": ["The employee no has already been taken."]
+        }
+      }
+    }
+  },
+
+  "2_login": {
+    "method": "POST",
+    "url": "/api/auth/login",
+    "auth_required": false,
+    "request_body": {
+      "email": "imran.sheikh2@university.edu",
+      "password": "password123"
+    },
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Login successful",
+        "data": {
+          "user": {
+            "id": 29,
+            "name": "Dr. Imran Sheikh",
+            "email": "imran.sheikh2@university.edu",
+            "role": "hod",
+            "status": "active",
+            "created_at": "2026-06-29T08:11:00.000000Z"
+          },
+          "token": "16|ZxYwVuTsRqPoNmLkJiHgFeDcBa1122334455"
+        }
+      }
+    },
+    "error_response_invalid_credentials": {
+      "status": 422,
+      "body": {
+        "message": "The provided credentials are incorrect.",
+        "errors": {
+          "email": ["The provided credentials are incorrect."]
+        }
+      }
+    },
+    "error_response_inactive_account": {
+      "status": 403,
+      "body": { "message": "Your account is inactive. Please contact the administrator." }
+    }
+  },
+
+  "3_hod_dashboard": {
+    "method": "GET",
+    "url": "/api/dashboard/hod",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {hod_token}" },
+    "description": "HOD-only route (middleware role:hod). Returns department info plus department-wide aggregate counts and today's attendance percentage across the whole department (DashboardService::hod()).",
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Success",
+        "data": {
+          "department": {
+            "id": 1,
+            "name": "Computer Science",
+            "hod_teacher_id": 12,
+            "hod": {
+              "id": 12,
+              "user_id": 29,
+              "department_id": 1,
+              "employee_no": "T-101",
+              "designation": "Professor",
+              "phone": "0300-7654321",
+              "is_hod": true,
+              "name": "Dr. Imran Sheikh",
+              "email": "imran.sheikh2@university.edu",
+              "status": "active",
+              "department": null,
+              "created_at": "..."
+            },
+            "teachers_count": null,
+            "students_count": null,
+            "created_at": "..."
+          },
+          "teachers_count": 8,
+          "students_count": 120,
+          "today_sessions_count": 5,
+          "today_attendance_percentage": 87.5
+        }
+      },
+      "notes": [
+        "'department.hod' is only populated when the relation is eager-loaded with 'hod' — here it reflects whoever departments.hod_teacher_id points to, which may or may not be the currently logged-in HOD if multiple teachers exist in the department.",
+        "'department.teachers_count' / 'department.students_count' inside the nested DepartmentResource are null here because those are whenCounted() fields not loaded by this endpoint — use the top-level teachers_count/students_count instead.",
+        "today_sessions_count counts ALL active+ended sessions today across every batch/program under this department, not just one teacher's classes.",
+        "today_attendance_percentage = round(present_attendance_rows / total_attendance_rows * 100, 1) across all of today's sessions in the department; 0.0 if no sessions ran today."
+      ]
+    },
+    "error_response_no_department": {
+      "status": 404,
+      "body": { "message": "No department is assigned to this HOD account." },
+      "note": "Thrown when the HOD's teacher row has no department_id set (or no teacher row exists at all)."
+    },
+    "error_response_wrong_role": {
+      "status": 403,
+      "body": { "message": "You do not have permission to perform this action." },
+      "note": "Returned by the role:hod middleware if a non-HOD account (e.g. role=teacher) calls this endpoint."
+    }
+  },
+
+  "4_sessions_list_department_scoped": {
+    "method": "GET",
+    "url": "/api/sessions",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {hod_token}" },
+    "description": "Shared endpoint for every role, but auto-scoped per role in SessionController::index(). For HOD it returns every ClassSession whose timetable->batch->program->department_id matches the HOD's own teacher->department_id — i.e. ALL sessions run by ALL teachers in their department, not just their own.",
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Success",
+        "data": [
+          {
+            "id": 14,
+            "timetable_id": 3,
+            "session_date": "2026-06-29",
+            "start_time": "08:00:00",
+            "end_time": "09:00:00",
+            "status": "ended",
+            "timetable": {
+              "id": 3,
+              "day": "Monday",
+              "course": { "course_code": "CS102", "course_title": "Data Structures" },
+              "batch": { "batch_name": "BSCS-2023-M" },
+              "room": { "room_no": "Room-101" },
+              "teacher": { "name": "Bilal Ahmed" }
+            },
+            "created_at": "..."
+          }
+        ]
+      },
+      "known_gap": "Paginated server-side (15 per page) but pagination meta (current_page/last_page/total) is not included in the response — only the flat array in 'data'."
+    }
+  },
+
+  "5_session_show_department_scoped": {
+    "method": "GET",
+    "url": "/api/sessions/{session}",
+    "url_example": "/api/sessions/14",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {hod_token}" },
+    "description": "Authorized via ClassSessionPolicy::view(). HOD may view any session whose timetable->batch->program->department_id equals their own teacher->department_id (i.e. any session within their department, regardless of which teacher ran it). Includes the full per-session present/absent/student counts (requires 'attendances' to be loaded, which this action does).",
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Success",
+        "data": {
+          "id": 14,
+          "timetable_id": 3,
+          "session_date": "2026-06-29",
+          "start_time": "08:00:00",
+          "end_time": "09:00:00",
+          "status": "ended",
+          "timetable": { "...": "full TimetableResource: batch, course, teacher, room, time_slot" },
+          "present_count": 5,
+          "absent_count": 3,
+          "student_count": 8,
+          "created_at": "..."
+        }
+      }
+    },
+    "error_response_outside_department": {
+      "status": 403,
+      "body": { "message": "This action is unauthorized." },
+      "note": "Happens when the session belongs to a timetable/batch/program in a department other than the HOD's own."
+    },
+    "error_response_not_found": {
+      "status": 404,
+      "body": { "message": "No query results for model [App\\\\Models\\\\ClassSession] 14" }
+    }
+  },
+
+  "6_actions_hod_cannot_perform": {
+    "description": "These endpoints exist but are gated to role=teacher only, either by route middleware (role:teacher group) or by policy. An HOD token calling them gets rejected before reaching any business logic.",
+    "start_session": {
+      "method": "POST",
+      "url": "/api/sessions/{timetable}/start",
+      "blocked_by": "route middleware role:teacher",
+      "error_response": {
+        "status": 403,
+        "body": { "message": "You do not have permission to perform this action." }
+      }
+    },
+    "end_session": {
+      "method": "POST",
+      "url": "/api/sessions/{session}/end",
+      "blocked_by": "route middleware role:teacher",
+      "error_response": {
+        "status": 403,
+        "body": { "message": "You do not have permission to perform this action." }
+      }
+    },
+    "session_attendance_detail": {
+      "method": "GET",
+      "url": "/api/sessions/{session}/attendance",
+      "blocked_by": "route middleware role:teacher",
+      "note": "Even though HOD can see a session's present/absent/student COUNTS via 5_session_show_department_scoped, the full per-student attendance breakdown endpoint is teacher-only.",
+      "error_response": {
+        "status": 403,
+        "body": { "message": "You do not have permission to perform this action." }
+      }
+    },
+    "block_unblock_student": {
+      "method": "POST",
+      "url": "/api/students/{student}/block (or /unblock)",
+      "blocked_by": "route middleware role:teacher",
+      "error_response": {
+        "status": 403,
+        "body": { "message": "You do not have permission to perform this action." }
+      }
+    },
+    "attendance_report": {
+      "method": "GET",
+      "url": "/api/attendance/report",
+      "blocked_by": "route middleware role:teacher",
+      "error_response": {
+        "status": 403,
+        "body": { "message": "You do not have permission to perform this action." }
+      }
+    },
+    "admin_management_endpoints": {
+      "examples": ["/api/teachers (POST)", "/api/timetables (POST)", "/api/departments/{id} (PUT)", "/api/students (POST)"],
+      "blocked_by": "route middleware role:admin",
+      "note": "HOD has no write access to teachers, timetables, departments, programs, batches, rooms, or students — those remain admin-only in the current implementation. HOD is read-only/aggregate-only (dashboard + department-scoped session viewing).",
+      "error_response": {
+        "status": 403,
+        "body": { "message": "You do not have permission to perform this action." }
+      }
+    }
+  },
+
+  "7_notifications_list_shared": {
+    "method": "GET",
+    "url": "/api/notifications",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {hod_token}" },
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Success",
+        "data": [
+          {
+            "id": 9,
+            "title": "Session Ended",
+            "message": "Session ended: 5 present, 3 absent.",
+            "type": "session_ended",
+            "related_data": { "session_id": 14, "present": 5, "absent": 3 },
+            "is_read": false,
+            "created_at": "2026-06-29T09:00:10.000000Z"
+          }
+        ]
+      },
+      "note": "HOD only receives notifications generated for their own account; there is no department-wide notification feed."
+    }
+  },
+
+  "8_notification_mark_read_shared": {
+    "method": "PUT",
+    "url": "/api/notifications/{notification}/read",
+    "url_example": "/api/notifications/9/read",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {hod_token}" },
+    "request_body": null,
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Notification marked as read",
+        "data": { "id": 9, "is_read": true }
+      }
+    },
+    "error_response_not_owner": {
+      "status": 403,
+      "body": { "message": "This action is unauthorized." }
+    }
+  },
+
+  "9_notification_delete_shared": {
+    "method": "DELETE",
+    "url": "/api/notifications/{notification}",
+    "url_example": "/api/notifications/9",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {hod_token}" },
+    "success_response": {
+      "status": 200,
+      "body": { "message": "Notification deleted", "data": null }
+    },
+    "error_response_not_owner": {
+      "status": 403,
+      "body": { "message": "This action is unauthorized." }
+    }
+  },
+
+  "10_logout_shared": {
+    "method": "POST",
+    "url": "/api/auth/logout",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {hod_token}" },
+    "request_body": null,
+    "success_response": {
+      "status": 200,
+      "body": { "message": "Logged out successfully", "data": null }
+    },
+    "note": "Only revokes the current device's token; other logged-in devices for the same HOD stay logged in."
+  },
+
+  "11_get_authenticated_user_shared": {
+    "method": "GET",
+    "url": "/api/auth/user",
+    "auth_required": true,
+    "headers": { "Authorization": "Bearer {hod_token}" },
+    "success_response": {
+      "status": 200,
+      "body": {
+        "message": "Authenticated user",
+        "data": {
+          "id": 29,
+          "name": "Dr. Imran Sheikh",
+          "email": "imran.sheikh2@university.edu",
+          "role": "hod",
+          "status": "active",
+          "created_at": "2026-06-29T08:11:00.000000Z"
+        }
+      }
+    },
+    "note": "Best endpoint to call after login/app-resume to confirm current role/status — always reflects live DB state. role will read 'hod' here, never a separate flag."
+  },
+
+  "12_data_model_reference": {
+    "note": "How HOD is identified and distinguished from a plain teacher, for anyone building the frontend or writing tests.",
+    "users_table": "role column is an enum including 'hod' — this is the actual source of truth checked by route middleware (role:hod) and User::isHod().",
+    "teachers_table": "Every HOD also has a row here (same table as teachers), with department_id REQUIRED and non-null for HOD accounts (enforced at registration, not by a DB constraint).",
+    "departments_table": "hod_teacher_id (nullable FK to teachers.id) marks which single teacher is the official head of that department. This is set by an admin (e.g. via PUT /api/departments/{id}) — registering with role=hod does NOT automatically set this column.",
+    "teacher_is_hod_computed_attribute": "Teacher::is_hod is a computed boolean: Department::where('hod_teacher_id', $this->id)->exists(). It reflects whether THIS SPECIFIC teacher row is the official department head — it has nothing to do with users.role. In theory a user with role=hod might not be set as hod_teacher_id on any department yet (is_hod would be false), and conversely a plain role=teacher row could theoretically be pointed to by hod_teacher_id.",
+    "dashboard_scoping_uses_role_not_flag": "DashboardService::hod() and SessionController's HOD branch both scope by $user->teacher->department_id (the HOD's own home department from the teachers table), NOT by checking is_hod or hod_teacher_id. So an HOD only ever sees their own department's data, determined purely by their teacher row's department_id."
+  }
+}
