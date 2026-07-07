@@ -30,6 +30,6 @@ class ClassSessionPolicy
 
     public function end(User $user, ClassSession $session): bool
     {
-        return $user->isTeacher() && $session->timetable->teacher->user_id === $user->id;
+        return ($user->isTeacher() || $user->isHod()) && $session->timetable->teacher->user_id === $user->id;
     }
 }

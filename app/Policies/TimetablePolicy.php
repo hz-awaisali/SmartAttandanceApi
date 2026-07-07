@@ -9,6 +9,6 @@ class TimetablePolicy
 {
     public function start(User $user, Timetable $timetable): bool
     {
-        return $user->isTeacher() && $timetable->teacher->user_id === $user->id;
+        return ($user->isTeacher() || $user->isHod()) && $timetable->teacher->user_id === $user->id;
     }
 }

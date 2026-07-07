@@ -59,8 +59,9 @@ class User extends Authenticatable
 
     /**
      * Strictly the "teacher" role. HOD is a distinct role that, per the
-     * permission matrix, cannot start/end sessions or block/unblock students
-     * even though an HOD always has an underlying teacher record.
+     * permission matrix, cannot block/unblock students even though an HOD
+     * always has an underlying teacher record and can start/end their own
+     * lectures like a teacher.
      */
     public function isTeacher(): bool
     {
