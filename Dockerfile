@@ -23,8 +23,6 @@ RUN php artisan cache:clear || true
 RUN php artisan route:clear || true
 RUN php artisan view:clear || true
 
-EXPOSE 80
+EXPOSE 8000
 
-# --force is required because artisan prompts for confirmation outside a local
-# environment, and there's no TTY to answer it in a container.
-CMD php artisan migrate --force && php artisan serve --host=0.0.0.0 --port=80
+CMD ["php","artisan","serve","--host=0.0.0.0","--port=8000"]
