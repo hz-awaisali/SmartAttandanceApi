@@ -16,6 +16,12 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->alias([
             'role' => \App\Http\Middleware\EnsureUserHasRole::class,
         ]);
+
+        // This is an API-only app with no "login" route to redirect guests to.
+        // Without this, unauthenticated requests that don't send an explicit
+        // "Accept: application/json" header crash with RouteNotFoundException
+        // instead of returning a 401 JSON response.
+        $middleware->redirectGuestsTo(fn () => null);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         $exceptions->shouldRenderJsonWhen(
