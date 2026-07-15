@@ -8,6 +8,7 @@ use App\Models\ClassSession;
 use App\Models\Student;
 use App\Models\Timetable;
 use App\Models\User;
+use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
 
 class SessionService
@@ -19,6 +20,8 @@ class SessionService
 
     public function start(Timetable $timetable, User $teacherUser): ClassSession
     {
+        $this->assertWithinPeriodWindow($timetable);
+
         $today = now()->toDateString();
 
         $alreadyActive = ClassSession::where('timetable_id', $timetable->id)
@@ -65,6 +68,27 @@ class SessionService
 
             return $session->load(['timetable.course', 'timetable.room', 'timetable.batch', 'timetable.teacher']);
         });
+    }
+
+    private function assertWithinPeriodWindow(Timetable $timetable): void
+    {
+        $slot = $timetable->timeSlot;
+        $now = now();
+
+        $start = Carbon::createFromTimeString($slot->start_time);
+        $end = Carbon::createFromTimeString($slot->end_time);
+
+        if ($now->lt($start)) {
+            throw new BusinessException(
+                "This period hasn't started yet. Attendance can be started at {$start->format('h:i A')}."
+            );
+        }
+
+        if ($now->gt($end)) {
+            throw new BusinessException(
+                "This period has already ended at {$end->format('h:i A')}. Attendance can no longer be started."
+            );
+        }
     }
 
     public function end(ClassSession $session, User $teacherUser): ClassSession
