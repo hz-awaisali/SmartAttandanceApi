@@ -71,11 +71,14 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('attendance/report', [AttendanceController::class, 'report']);
     });
 
-    // HOD can browse teachers and students, scoped to their own department
-    // (see TeacherController::index / StudentController::index).
+    // HOD can browse teachers, students, and timetables, scoped to their own
+    // department (see TeacherController::index / StudentController::index /
+    // TimetableController::index). Read-only - creating/editing timetables
+    // is still admin-only below.
     Route::middleware('role:admin,hod')->group(function () {
         Route::get('teachers', [TeacherController::class, 'index']);
         Route::get('students', [AdminStudentController::class, 'index']);
+        Route::get('timetables', [TimetableController::class, 'index']);
     });
 
     Route::middleware('role:admin')->group(function () {
@@ -112,7 +115,6 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('students/{student}', [AdminStudentController::class, 'show']);
         Route::put('students/{student}', [AdminStudentController::class, 'update']);
 
-        Route::get('timetables', [TimetableController::class, 'index']);
         Route::post('timetables', [TimetableController::class, 'store']);
         Route::get('timetables/{timetable}', [TimetableController::class, 'show']);
         Route::put('timetables/{timetable}', [TimetableController::class, 'update']);

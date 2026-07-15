@@ -9,16 +9,23 @@ use App\Http\Resources\TimetableResource;
 use App\Models\Timetable;
 use App\Services\TimetableService;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 
 class TimetableController extends Controller
 {
     public function __construct(private TimetableService $timetables) {}
 
-    public function index(): JsonResponse
+    public function index(Request $request): JsonResponse
     {
-        $timetables = Timetable::with(['batch', 'course', 'teacher.user', 'room', 'timeSlot'])
-            ->latest()
-            ->paginate(15);
+        $query = Timetable::with(['batch', 'course', 'teacher.user', 'room', 'timeSlot']);
+
+        if ($request->user()->isHod()) {
+            $query->whereHas('batch.program', function ($q) use ($request) {
+                $q->where('department_id', $request->user()->teacher?->department_id);
+            });
+        }
+
+        $timetables = $query->latest()->paginate(15);
 
         return $this->ok(TimetableResource::collection($timetables));
     }
