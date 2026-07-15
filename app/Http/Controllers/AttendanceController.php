@@ -52,7 +52,9 @@ class AttendanceController extends Controller
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
 
-        if ($user->isHod()) {
+        if ($user->isAdmin()) {
+            $report = $this->reports->generateGlobal($filters);
+        } elseif ($user->isHod()) {
             $departmentId = $user->teacher?->department_id;
 
             if (! $departmentId) {

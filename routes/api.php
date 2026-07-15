@@ -63,6 +63,11 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('sessions/{session}/end', [SessionController::class, 'end']);
         Route::get('sessions/{session}/attendance', [SessionController::class, 'attendance']);
         Route::get('teacher/schedule', [TeacherScheduleController::class, 'schedule']);
+    });
+
+    // Admin gets the same report, unscoped across every department (see
+    // AttendanceController::report / AttendanceReportService::generateGlobal).
+    Route::middleware('role:teacher,hod,admin')->group(function () {
         Route::get('attendance/report', [AttendanceController::class, 'report']);
     });
 
