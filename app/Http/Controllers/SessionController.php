@@ -25,10 +25,21 @@ class SessionController extends Controller
         } elseif ($user->isStudent()) {
             $query->whereHas('timetable', fn ($q) => $q->where('batch_id', $user->student?->batch_id));
         } elseif ($user->isHod()) {
-            $query->whereHas('timetable.batch.program', fn ($q) => $q->where('department_id', $user->teacher?->department_id));
+            // ?mine=1 narrows the department-wide list to the HOD's own
+            // teaching sessions (same scoping as a teacher) - used by the
+            // HOD panel's "My Classes" / "My Schedule" widgets, which would
+            // otherwise miss their own session once the department has more
+            // sessions than one page.
+            if ($request->boolean('mine')) {
+                $query->whereHas('timetable', fn ($q) => $q->where('teacher_id', $user->teacher?->id));
+            } else {
+                $query->whereHas('timetable.batch.program', fn ($q) => $q->where('department_id', $user->teacher?->department_id));
+            }
         }
 
-        $sessions = $query->latest('session_date')->paginate(15);
+        // session_date is a date column, so same-day sessions tie; order by
+        // id as well so a freshly started session is always on page 1.
+        $sessions = $query->latest('session_date')->latest('id')->paginate(15);
 
         return $this->ok(ClassSessionResource::collection($sessions));
     }
