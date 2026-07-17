@@ -14,7 +14,6 @@ use App\Services\TeacherService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\Password;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 
@@ -82,30 +81,50 @@ class AuthController extends Controller
 
     public function forgotPassword(ForgotPasswordRequest $request): JsonResponse
     {
-        $status = Password::sendResetLink($request->only('email'));
+        $this->findUserForPasswordReset($request->email, $request->identity_no);
 
-        if ($status !== Password::RESET_LINK_SENT) {
-            throw ValidationException::withMessages(['email' => [__($status)]]);
-        }
-
-        return $this->ok(null, __($status));
+        return $this->ok(null, 'Identity verified. You can now set a new password.');
     }
 
     public function resetPassword(ResetPasswordRequest $request): JsonResponse
     {
-        $status = Password::reset(
-            $request->only('email', 'password', 'password_confirmation', 'token'),
-            function (User $user, string $password) {
-                $user->forceFill(['password' => $password])->setRememberToken(Str::random(60));
-                $user->save();
-                $user->tokens()->delete();
-            }
-        );
+        $user = $this->findUserForPasswordReset($request->email, $request->identity_no);
 
-        if ($status !== Password::PASSWORD_RESET) {
-            throw ValidationException::withMessages(['email' => [__($status)]]);
+        $user->forceFill(['password' => $request->password])->setRememberToken(Str::random(60));
+        $user->save();
+        $user->tokens()->delete();
+
+        return $this->ok(null, 'Your password has been reset.');
+    }
+
+    /**
+     * Direct (no email link) reset flow: the requester must supply the ID on
+     * file alongside the email — a student's registration_no or a
+     * teacher/HOD's employee_no — so knowing an email alone isn't enough to
+     * take over an account.
+     */
+    private function findUserForPasswordReset(string $email, string $identityNo): User
+    {
+        $user = User::where('email', $email)->first();
+
+        if (! $user) {
+            throw ValidationException::withMessages(['email' => ["We can't find a user with that email address."]]);
         }
 
-        return $this->ok(null, __($status));
+        $expected = match ($user->role) {
+            'student' => $user->student?->registration_no,
+            'teacher', 'hod' => $user->teacher?->employee_no,
+            default => null,
+        };
+
+        if ($expected === null) {
+            throw ValidationException::withMessages(['identity_no' => ['Password reset is not available for this account.']]);
+        }
+
+        if (strcasecmp(trim($identityNo), $expected) !== 0) {
+            throw ValidationException::withMessages(['identity_no' => ['The provided ID does not match our records.']]);
+        }
+
+        return $user;
     }
 }
