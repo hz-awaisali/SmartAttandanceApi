@@ -16,7 +16,7 @@ class UpdateOfficeRequest extends FormRequest
     {
         return [
             'name' => ['sometimes', 'required', 'string', 'max:255', Rule::unique('offices', 'name')->ignore($this->route('office'))],
-            'department_id' => ['nullable', 'integer', 'exists:departments,id'],
+            'admin_department_id' => ['sometimes', 'required', 'integer', 'exists:admin_departments,id'],
             'user_ids' => ['sometimes', 'array'],
             'user_ids.*' => ['integer', 'exists:users,id'],
         ];

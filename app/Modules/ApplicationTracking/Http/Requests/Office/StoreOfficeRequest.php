@@ -15,8 +15,7 @@ class StoreOfficeRequest extends FormRequest
     {
         return [
             'name' => ['required', 'string', 'max:255', 'unique:offices,name'],
-            // null = university-wide office; set = scoped to that department.
-            'department_id' => ['nullable', 'integer', 'exists:departments,id'],
+            'admin_department_id' => ['required', 'integer', 'exists:admin_departments,id'],
             'user_ids' => ['sometimes', 'array'],
             'user_ids.*' => ['integer', 'exists:users,id'],
         ];

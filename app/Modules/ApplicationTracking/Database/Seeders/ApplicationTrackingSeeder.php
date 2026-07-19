@@ -2,6 +2,8 @@
 
 namespace App\Modules\ApplicationTracking\Database\Seeders;
 
+use App\Models\AdminDepartment;
+use App\Models\Staff;
 use App\Models\User;
 use App\Modules\ApplicationTracking\Models\ApplicationCategory;
 use App\Modules\ApplicationTracking\Models\Office;
@@ -18,17 +20,21 @@ class ApplicationTrackingSeeder extends Seeder
 {
     public function run(): void
     {
-        $examinationOfficer = $this->makeOfficial('Examination Officer', 'examination.officer@university.edu');
-        $transportOfficer = $this->makeOfficial('Transport Officer', 'transport.officer@university.edu');
-        $itOfficer = $this->makeOfficial('IT Officer', 'it.officer@university.edu');
+        $examinationOfficer = $this->makeOfficial('Examination Officer', 'examination.officer@university.edu', 'EMP-EX-001', 'Examination Department');
+        $transportOfficer = $this->makeOfficial('Transport Officer', 'transport.officer@university.edu', 'EMP-TR-001', 'Transport Department');
+        $itOfficer = $this->makeOfficial('IT Officer', 'it.officer@university.edu', 'EMP-IT-001', 'IT Department');
 
-        $examinationOffice = Office::firstOrCreate(['name' => 'Examination Officer'], ['department_id' => null]);
+        $examinationDept = AdminDepartment::where('name', 'Examination Department')->firstOrFail();
+        $transportDept = AdminDepartment::where('name', 'Transport Department')->firstOrFail();
+        $itDept = AdminDepartment::where('name', 'IT Department')->firstOrFail();
+
+        $examinationOffice = Office::firstOrCreate(['name' => 'Examination Officer'], ['admin_department_id' => $examinationDept->id]);
         $examinationOffice->users()->syncWithoutDetaching([$examinationOfficer->id]);
 
-        $transportOffice = Office::firstOrCreate(['name' => 'Transport Officer'], ['department_id' => null]);
+        $transportOffice = Office::firstOrCreate(['name' => 'Transport Officer'], ['admin_department_id' => $transportDept->id]);
         $transportOffice->users()->syncWithoutDetaching([$transportOfficer->id]);
 
-        $itOffice = Office::firstOrCreate(['name' => 'IT Officer'], ['department_id' => null]);
+        $itOffice = Office::firstOrCreate(['name' => 'IT Officer'], ['admin_department_id' => $itDept->id]);
         $itOffice->users()->syncWithoutDetaching([$itOfficer->id]);
 
         $this->seedTranscriptRequest($examinationOffice);
@@ -138,11 +144,29 @@ class ApplicationTrackingSeeder extends Seeder
         ]);
     }
 
-    private function makeOfficial(string $name, string $email): User
+    /**
+     * Creates a real `staff` account (not `teacher`) - these accounts
+     * represent non-teaching administrative office holders, so they get
+     * the attendance-module-blind `staff` role and a Staff profile
+     * scoped to a real AdminDepartment, same as an admin would create via
+     * POST /api/staff.
+     */
+    private function makeOfficial(string $name, string $email, string $employeeNo, string $adminDepartmentName): User
     {
-        return User::firstOrCreate(
+        $user = User::firstOrCreate(
             ['email' => $email],
-            ['name' => $name, 'password' => 'password', 'role' => 'teacher', 'status' => 'active'],
+            ['name' => $name, 'password' => 'password', 'role' => 'staff', 'status' => 'active'],
         );
+
+        Staff::firstOrCreate(
+            ['user_id' => $user->id],
+            [
+                'admin_department_id' => AdminDepartment::where('name', $adminDepartmentName)->firstOrFail()->id,
+                'employee_no' => $employeeNo,
+                'designation' => $name,
+            ],
+        );
+
+        return $user;
     }
 }

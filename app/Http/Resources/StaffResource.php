@@ -12,14 +12,14 @@ class StaffResource extends JsonResource
         return [
             'id' => $this->id,
             'user_id' => $this->user_id,
-            'department_id' => $this->department_id,
+            'admin_department_id' => $this->admin_department_id,
             'employee_no' => $this->employee_no,
             'designation' => $this->designation,
             'phone' => $this->phone,
             'name' => $this->whenLoaded('user', fn () => $this->user->name),
             'email' => $this->whenLoaded('user', fn () => $this->user->email),
             'status' => $this->whenLoaded('user', fn () => $this->user->status),
-            'department' => DepartmentResource::make($this->whenLoaded('department')),
+            'admin_department' => AdminDepartmentResource::make($this->whenLoaded('adminDepartment')),
             'created_at' => $this->created_at,
         ];
     }

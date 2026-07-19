@@ -17,7 +17,7 @@ class UpdateStaffRequest extends FormRequest
         return [
             'name' => ['sometimes', 'required', 'string', 'max:255'],
             'email' => ['sometimes', 'required', 'email', 'max:255', Rule::unique('users', 'email')->ignore($this->route('staff')?->user_id)],
-            'department_id' => ['sometimes', 'nullable', 'integer', 'exists:departments,id'],
+            'admin_department_id' => ['sometimes', 'required', 'integer', 'exists:admin_departments,id'],
             'employee_no' => ['sometimes', 'required', 'string', 'max:50', Rule::unique('staff', 'employee_no')->ignore($this->route('staff'))],
             'designation' => ['sometimes', 'required', 'string', 'max:100'],
             'phone' => ['nullable', 'string', 'max:20'],

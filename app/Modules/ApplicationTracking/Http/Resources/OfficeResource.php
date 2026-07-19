@@ -2,6 +2,7 @@
 
 namespace App\Modules\ApplicationTracking\Http\Resources;
 
+use App\Http\Resources\AdminDepartmentResource;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -12,11 +13,8 @@ class OfficeResource extends JsonResource
         return [
             'id' => $this->id,
             'name' => $this->name,
-            'department_id' => $this->department_id,
-            'department' => $this->when($this->relationLoaded('department') && $this->department, fn () => [
-                'id' => $this->department->id,
-                'name' => $this->department->name,
-            ]),
+            'admin_department_id' => $this->admin_department_id,
+            'admin_department' => AdminDepartmentResource::make($this->whenLoaded('adminDepartment')),
             'users' => $this->when($this->relationLoaded('users'), fn () => $this->users->map(fn ($user) => [
                 'id' => $user->id,
                 'name' => $user->name,

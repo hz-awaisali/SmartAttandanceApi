@@ -21,7 +21,7 @@ class StaffService
 
             return Staff::create([
                 'user_id' => $user->id,
-                'department_id' => $data['department_id'] ?? null,
+                'admin_department_id' => $data['admin_department_id'],
                 'employee_no' => $data['employee_no'],
                 'designation' => $data['designation'],
                 'phone' => $data['phone'] ?? null,
@@ -33,7 +33,7 @@ class StaffService
     {
         return DB::transaction(function () use ($staff, $data) {
             $staff->user->fill(array_intersect_key($data, array_flip(['name', 'email', 'status'])))->save();
-            $staff->fill(array_intersect_key($data, array_flip(['department_id', 'employee_no', 'designation', 'phone'])))->save();
+            $staff->fill(array_intersect_key($data, array_flip(['admin_department_id', 'employee_no', 'designation', 'phone'])))->save();
 
             return $staff;
         });

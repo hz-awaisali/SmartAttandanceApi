@@ -204,11 +204,16 @@ tests, each one creates its own fixtures.
 Coverage today: `AttendanceReportTest`, `PasswordResetTest`,
 `ApplicationTrackingTest` (submit → approve → advance → approve; reject →
 resubmit → re-enters the same step; direct-to-officer with no HOD step;
-403 for the wrong office; duplicate-active-application blocked; cancel;
-unstaffed-office guard), and `StaffAccountTest` (admin creates a staff
-account; a staff account holds an Office and acts on an assigned
-application; every attendance-module route 403s for staff; `GET /sessions`
-returns empty for staff; staff password reset via `employee_no`).
+403 for the wrong office; a workflow step narrowed to one specific office
+member — targeted user can act, other office holders cannot and don't see
+it in their queue; duplicate-active-application blocked; cancel;
+unstaffed-office guard), `StaffAccountTest` (admin creates a staff account
+with a required `admin_department_id`; a staff account holds an Office and
+acts on an assigned application; the staff dashboard shows identity +
+pending queue; every attendance-module route 403s for staff; `GET
+/sessions` returns empty for staff; staff password reset via
+`employee_no`), and `AdminDepartmentTest` (the four baseline rows exist
+after migrating; admin CRUD; non-admin blocked).
 
 ---
 
@@ -443,9 +448,16 @@ Timetable (Batch + ProgramCourse + Teacher + Room + Day + TimeSlot)
 - **Teacher** — `is_hod` is *computed* (true iff `Department.hod_teacher_id`
   points at this teacher), never a stored flag.
 - **Staff** — non-teaching office holders (Examination Officer, Registrar,
-  ...). Same shape as `Teacher` minus any teaching-specific concept;
-  `department_id` is nullable and typically unset (these are usually
-  university-wide positions).
+  ...). Same shape as `Teacher` minus any teaching-specific concept, but
+  belongs to an **`AdminDepartment`** — a completely separate hierarchy
+  from academic `Department` (Examination Department, IT Department,
+  Registrar Office, Transport Department, ...). See
+  [Non-teaching office holders](#non-teaching-office-holders--the-staff-role)
+  above and [STAFF_ACCOUNTS.md](STAFF_ACCOUNTS.md) for why these are two
+  distinct hierarchies rather than one.
+- **AdminDepartment** — the administrative counterpart to `Department`.
+  `admin_department_id` on `Staff` and on the Application Tracking
+  module's `Office` both point here, never at academic `Department`.
 - **Room** — `beacon_major` + `beacon_uuid` (the iBeacon identity) +
   `rssi_threshold`.
 - **Notification** — a simple directly-queryable table (not Laravel's
@@ -457,9 +469,10 @@ own migrations, zero changes to any table above):
 
 ```
 Office ──< office_user >── User
-Department ──< Office (nullable — null = university-wide)
+AdminDepartment ──< Office (required — every Office belongs to an admin department)
 
 WorkflowTemplate ──< WorkflowStep (self-referencing "next step on approval")
+WorkflowStep ──> Office (optionally narrowed to one specific User within it)
 
 ApplicationCategory ──> WorkflowTemplate
 Application ──> ApplicationCategory, User (applicant), WorkflowStep (current)
@@ -506,7 +519,7 @@ are 422 with an `errors` map; domain-rule failures use
 | Teacher + HOD | `POST sessions/{timetable}/start`, `POST sessions/{session}/end`, `GET sessions/{session}/attendance`, `GET teacher/schedule` |
 | Reporting | `GET attendance/report` (scope depends on role: teacher → own classes, HOD → own department, admin → global) |
 | Admin + HOD (read) | `GET teachers`, `GET students`, `GET timetables` |
-| Admin CRUD | `departments`, `programs`, `program-courses`, `batches`, `rooms`, `time-slots`, `teachers`, `students`, `timetables`, `staff`, `GET dashboard/admin` |
+| Admin CRUD | `departments`, `programs`, `program-courses`, `batches`, `rooms`, `time-slots`, `teachers`, `students`, `timetables`, `staff`, `admin-departments`, `GET dashboard/admin` |
 | HOD | `GET dashboard/hod` |
 | Profile (any role) | `GET/PUT profile`, `PUT profile/password`, `POST/DELETE profile/avatar`, `DELETE profile` |
 | Shared | `GET sessions`, `GET sessions/{session}`, `GET notifications`, `PUT notifications/{id}/read`, `DELETE notifications/{id}` |
@@ -519,7 +532,8 @@ are 422 with an `errors` map; domain-rule failures use
 | Area | Routes |
 |---|---|
 | Any authenticated user | `GET application-categories` (role-filtered), `POST applications`, `GET applications` (mine, or `?assigned=1` for officials — supports `?status=&category_id=&from=&to=&sort=`), `GET applications/{id}`, `POST applications/{id}/act`, `POST applications/{id}/resubmit`, `POST applications/{id}/cancel` |
-| Admin only | `GET applications/dashboard` (counts by status, avg turnaround, pending-per-office), full CRUD on `offices`, `workflow-templates` (+ steps), and mutations on `application-categories` |
+| Staff only | `GET dashboard/staff` (identity + pending-approvals queue) |
+| Admin only | `GET applications/dashboard` (counts by status, avg turnaround, pending-per-office), full CRUD on `offices` (each requiring an `admin_department_id`), `workflow-templates` (+ steps, optionally narrowed to one specific office member via `approver_user_id`), and mutations on `application-categories` |
 
 </details>
 
@@ -550,7 +564,7 @@ routes/
 ├── api.php                        core attendance system (module routes are NOT here — see above)
 └── web.php                        health check only
 
-tests/Feature/                     AttendanceReportTest, PasswordResetTest, ApplicationTrackingTest, StaffAccountTest
+tests/Feature/                     AttendanceReportTest, PasswordResetTest, ApplicationTrackingTest, StaffAccountTest, AdminDepartmentTest
 ```
 
 ---

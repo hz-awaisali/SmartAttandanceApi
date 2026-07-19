@@ -11,10 +11,13 @@ use App\Modules\ApplicationTracking\Models\Application;
 use App\Modules\ApplicationTracking\Models\ApplicationCategory;
 use App\Modules\ApplicationTracking\Models\Office;
 use App\Modules\ApplicationTracking\Services\ApplicationWorkflowService;
+use App\Exceptions\BusinessException;
 use App\Models\Department;
+use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Collection;
 
 class ApplicationController extends Controller
 {
@@ -38,6 +41,91 @@ class ApplicationController extends Controller
         $categories = $query->paginate(15);
 
         return $this->paginated(ApplicationCategoryResource::collection($categories), $categories);
+    }
+
+    /**
+     * A staff member's home screen: identity, offices held, and their
+     * pending-approvals queue - the same authority rules that gate
+     * ?assigned=1 and act(), packaged as a dashboard.
+     */
+    public function dashboard(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        $staff = $user->staff;
+
+        if (! $staff) {
+            throw new BusinessException('No staff profile is linked to this account. Please contact the administrator.', 404);
+        }
+
+        $staff->load('adminDepartment');
+
+        $offices = Office::whereHas('users', fn ($q) => $q->where('users.id', $user->id))->get();
+        $officeIds = $offices->pluck('id');
+        $hodDepartmentIds = $this->hodDepartmentIdsFor($user);
+
+        $pending = Application::with(['category', 'currentStep.office', 'applicant.student', 'applicant.teacher'])
+            ->whereIn('status', ['pending', 'returned_for_revision'])
+            ->get()
+            ->filter(fn (Application $application) => $this->isAssignedToUser($application, $user, $officeIds, $hodDepartmentIds))
+            ->values();
+
+        return $this->ok([
+            'staff' => [
+                'employee_no' => $staff->employee_no,
+                'designation' => $staff->designation,
+                'admin_department' => $staff->adminDepartment ? [
+                    'id' => $staff->adminDepartment->id,
+                    'name' => $staff->adminDepartment->name,
+                ] : null,
+            ],
+            'offices' => $offices->map(fn (Office $office) => ['id' => $office->id, 'name' => $office->name])->values(),
+            'pending_count' => $pending->count(),
+            'pending_applications' => ApplicationResource::collection($pending->take(10)),
+        ]);
+    }
+
+    private function officeIdsFor(User $user): Collection
+    {
+        return Office::whereHas('users', fn ($q) => $q->where('users.id', $user->id))->pluck('id');
+    }
+
+    private function hodDepartmentIdsFor(User $user): Collection
+    {
+        return $user->teacher
+            ? Department::where('hod_teacher_id', $user->teacher->id)->pluck('id')
+            : collect();
+    }
+
+    /**
+     * Whether $user currently holds acting/visibility authority over
+     * $application's current step - the same office/HOD/narrowed-officer
+     * rules ApplicationPolicy enforces, shared by ?assigned=1 and the
+     * staff dashboard's pending queue.
+     */
+    private function isAssignedToUser(Application $application, User $user, Collection $officeIds, Collection $hodDepartmentIds): bool
+    {
+        $step = $application->currentStep;
+
+        if (! $step) {
+            return false;
+        }
+
+        if ($step->approver_type === 'office') {
+            if ($step->approver_user_id) {
+                return $step->approver_user_id === $user->id;
+            }
+
+            return $officeIds->contains($step->approver_office_id);
+        }
+
+        if ($step->approver_type === 'applicant_department_hod') {
+            $departmentId = $application->applicant->student?->department_id
+                ?? $application->applicant->teacher?->department_id;
+
+            return $departmentId && $hodDepartmentIds->contains($departmentId);
+        }
+
+        return false;
     }
 
     public function index(Request $request): JsonResponse
@@ -84,31 +172,12 @@ class ApplicationController extends Controller
         // the same authority rules ApplicationPolicy enforces per-application.
         // At FYP scale, filtering the (small) pending set in PHP keeps this
         // logic in one place instead of duplicating it as diverging SQL.
-        $officeIds = Office::whereHas('users', fn ($q) => $q->where('users.id', $user->id))->pluck('id');
-        $hodDepartmentIds = $user->teacher
-            ? Department::where('hod_teacher_id', $user->teacher->id)->pluck('id')
-            : collect();
+        $officeIds = $this->officeIdsFor($user);
+        $hodDepartmentIds = $this->hodDepartmentIdsFor($user);
 
-        $filtered = $query->get()->filter(function (Application $application) use ($officeIds, $hodDepartmentIds) {
-            $step = $application->currentStep;
-
-            if (! $step) {
-                return false;
-            }
-
-            if ($step->approver_type === 'office') {
-                return $officeIds->contains($step->approver_office_id);
-            }
-
-            if ($step->approver_type === 'applicant_department_hod') {
-                $departmentId = $application->applicant->student?->department_id
-                    ?? $application->applicant->teacher?->department_id;
-
-                return $departmentId && $hodDepartmentIds->contains($departmentId);
-            }
-
-            return false;
-        })->values();
+        $filtered = $query->get()
+            ->filter(fn (Application $application) => $this->isAssignedToUser($application, $user, $officeIds, $hodDepartmentIds))
+            ->values();
 
         $page = max(1, (int) $request->integer('page', 1));
         $perPage = 15;

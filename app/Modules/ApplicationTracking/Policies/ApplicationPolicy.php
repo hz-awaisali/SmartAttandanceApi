@@ -59,7 +59,7 @@ class ApplicationPolicy
             return false;
         }
 
-        if ($this->holdsOffice($user, $step->approver_office_id) || $this->isApplicantDepartmentHod($user, $application, $step)) {
+        if ($this->holdsStepOfficeAuthority($user, $step) || $this->isApplicantDepartmentHod($user, $application, $step)) {
             return true;
         }
 
@@ -75,6 +75,25 @@ class ApplicationPolicy
         }
 
         return false;
+    }
+
+    /**
+     * Authority over the step's OWN configured office - narrowed to one
+     * specific person if the step targets one, otherwise any office
+     * holder. Does not apply to ad-hoc forwarded offices, which always
+     * stay broadcast to the whole destination office (see holdsOffice()).
+     */
+    private function holdsStepOfficeAuthority(User $user, WorkflowStep $step): bool
+    {
+        if (! $step->approver_office_id) {
+            return false;
+        }
+
+        if ($step->approver_user_id) {
+            return $step->approver_user_id === $user->id;
+        }
+
+        return $this->holdsOffice($user, $step->approver_office_id);
     }
 
     private function holdsOffice(User $user, ?int $officeId): bool

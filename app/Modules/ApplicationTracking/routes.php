@@ -28,6 +28,13 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('applications/dashboard', [ApplicationDashboardController::class, 'stats']);
     });
 
+    // A staff member's own home screen: identity + their pending-approvals
+    // queue. Registered here (module owns this data) even though every
+    // other dashboard/{role} route lives in the core routes/api.php.
+    Route::middleware('role:staff')->group(function () {
+        Route::get('dashboard/staff', [ApplicationController::class, 'dashboard']);
+    });
+
     Route::get('applications', [ApplicationController::class, 'index']);
     Route::get('applications/{application}', [ApplicationController::class, 'show']);
     Route::post('applications/{application}/act', [ApplicationController::class, 'act']);

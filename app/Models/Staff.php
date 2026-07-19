@@ -9,15 +9,15 @@ class Staff extends Model
 {
     protected $table = 'staff';
 
-    protected $fillable = ['user_id', 'department_id', 'employee_no', 'designation', 'phone'];
+    protected $fillable = ['user_id', 'admin_department_id', 'employee_no', 'designation', 'phone'];
 
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
     }
 
-    public function department(): BelongsTo
+    public function adminDepartment(): BelongsTo
     {
-        return $this->belongsTo(Department::class);
+        return $this->belongsTo(AdminDepartment::class);
     }
 }

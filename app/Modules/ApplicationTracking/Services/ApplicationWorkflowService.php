@@ -308,6 +308,12 @@ class ApplicationWorkflowService
     private function resolveApprovers(WorkflowStep $step, User $applicant): Collection
     {
         if ($step->approver_type === 'office') {
+            if ($step->approver_user_id) {
+                $approver = User::find($step->approver_user_id);
+
+                return $approver ? collect([$approver]) : collect();
+            }
+
             return $step->office?->users ?? collect();
         }
 

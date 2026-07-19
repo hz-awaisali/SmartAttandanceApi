@@ -217,6 +217,78 @@ class ApplicationTrackingTest extends TestCase
             ->assertForbidden();
     }
 
+    public function test_workflow_step_can_target_one_specific_office_member(): void
+    {
+        [$examOffice, $targetedOfficer] = $this->makeOffice('Examination Officer', 'exam.officer@example.com');
+        $otherOfficer = User::factory()->create(['email' => 'other.officer@example.com', 'role' => 'teacher', 'status' => 'active']);
+        $examOffice->users()->attach($otherOfficer->id);
+
+        $template = WorkflowTemplate::create(['name' => 'Targeted Workflow', 'is_active' => true]);
+        WorkflowStep::create([
+            'workflow_template_id' => $template->id,
+            'step_order' => 1,
+            'name' => 'Examination Officer',
+            'approver_type' => 'office',
+            'approver_office_id' => $examOffice->id,
+            'approver_user_id' => $targetedOfficer->id,
+            'on_reject_action' => 'terminate',
+        ]);
+
+        $category = ApplicationCategory::create([
+            'name' => 'Transcript Request',
+            'form_schema' => [['key' => 'reason', 'label' => 'Reason', 'type' => 'textarea', 'required' => true]],
+            'workflow_template_id' => $template->id,
+        ]);
+
+        $submit = $this->actingAs($this->studentUser)->postJson('/api/applications', [
+            'application_category_id' => $category->id,
+            'form_data' => ['reason' => 'Need transcript'],
+        ]);
+        $applicationId = $submit->json('data.id');
+
+        // The non-targeted office member neither sees it in their queue...
+        $this->actingAs($otherOfficer)
+            ->getJson('/api/applications?assigned=1')
+            ->assertOk()
+            ->assertJsonCount(0, 'data');
+
+        // ...nor can act on it, even though they hold the same office.
+        $this->actingAs($otherOfficer)
+            ->postJson("/api/applications/{$applicationId}/act", ['action' => 'approve'])
+            ->assertForbidden();
+
+        // The targeted member sees it and can act on it.
+        $this->actingAs($targetedOfficer)
+            ->getJson('/api/applications?assigned=1')
+            ->assertOk()
+            ->assertJsonPath('data.0.id', $applicationId);
+
+        $this->actingAs($targetedOfficer)
+            ->postJson("/api/applications/{$applicationId}/act", ['action' => 'approve'])
+            ->assertOk()
+            ->assertJsonPath('data.status', 'approved');
+    }
+
+    public function test_targeted_approver_must_be_a_member_of_the_chosen_office(): void
+    {
+        [$examOffice] = $this->makeOffice('Examination Officer', 'exam.officer@example.com');
+        $notAMember = User::factory()->create(['email' => 'not.a.member@example.com', 'role' => 'teacher', 'status' => 'active']);
+
+        $this->actingAs(User::factory()->create(['role' => 'admin']))
+            ->postJson('/api/workflow-templates', [
+                'name' => 'Invalid Targeted Workflow',
+                'steps' => [
+                    [
+                        'name' => 'Examination Officer',
+                        'approver_type' => 'office',
+                        'approver_office_id' => $examOffice->id,
+                        'approver_user_id' => $notAMember->id,
+                    ],
+                ],
+            ])
+            ->assertStatus(422);
+    }
+
     public function test_duplicate_active_application_is_blocked(): void
     {
         [$examOffice] = $this->makeOffice('Examination Officer', 'exam.officer@example.com');

@@ -2,6 +2,7 @@
 
 namespace Tests\Feature;
 
+use App\Models\AdminDepartment;
 use App\Models\Batch;
 use App\Models\ClassSession;
 use App\Models\Department;
@@ -34,21 +35,37 @@ class StaffAccountTest extends TestCase
 
     public function test_admin_can_create_a_staff_account(): void
     {
+        $transportDept = AdminDepartment::where('name', 'Transport Department')->firstOrFail();
+
         $response = $this->actingAs($this->admin)->postJson('/api/staff', [
             'name' => 'Nasir Iqbal',
             'email' => 'nasir.transport@example.com',
             'password' => 'password123',
             'password_confirmation' => 'password123',
+            'admin_department_id' => $transportDept->id,
             'employee_no' => 'OFF-001',
             'designation' => 'Transport Officer',
         ]);
 
         $response->assertCreated()
             ->assertJsonPath('data.employee_no', 'OFF-001')
-            ->assertJsonPath('data.designation', 'Transport Officer');
+            ->assertJsonPath('data.designation', 'Transport Officer')
+            ->assertJsonPath('data.admin_department_id', $transportDept->id);
 
         $this->assertDatabaseHas('users', ['email' => 'nasir.transport@example.com', 'role' => 'staff']);
-        $this->assertDatabaseHas('staff', ['employee_no' => 'OFF-001']);
+        $this->assertDatabaseHas('staff', ['employee_no' => 'OFF-001', 'admin_department_id' => $transportDept->id]);
+    }
+
+    public function test_creating_a_staff_account_without_an_admin_department_fails_validation(): void
+    {
+        $this->actingAs($this->admin)->postJson('/api/staff', [
+            'name' => 'Nasir Iqbal',
+            'email' => 'nasir.transport@example.com',
+            'password' => 'password123',
+            'password_confirmation' => 'password123',
+            'employee_no' => 'OFF-001',
+            'designation' => 'Transport Officer',
+        ])->assertStatus(422)->assertJsonValidationErrors('admin_department_id');
     }
 
     public function test_staff_can_hold_an_office_and_act_on_an_assigned_application(): void
@@ -90,6 +107,52 @@ class StaffAccountTest extends TestCase
             ->postJson("/api/applications/{$applicationId}/act", ['action' => 'approve'])
             ->assertOk()
             ->assertJsonPath('data.status', 'approved');
+    }
+
+    public function test_staff_dashboard_shows_identity_and_pending_queue(): void
+    {
+        $transportDept = AdminDepartment::where('name', 'Transport Department')->firstOrFail();
+
+        $user = User::factory()->create(['role' => 'staff', 'status' => 'active']);
+        \App\Models\Staff::create([
+            'user_id' => $user->id,
+            'admin_department_id' => $transportDept->id,
+            'employee_no' => 'OFF-003',
+            'designation' => 'Transport Officer',
+        ]);
+
+        $office = Office::create(['name' => 'Transport Officer', 'admin_department_id' => $transportDept->id]);
+        $office->users()->attach($user->id);
+
+        $template = WorkflowTemplate::create(['name' => 'Transport Pass Workflow 2', 'is_active' => true]);
+        WorkflowStep::create([
+            'workflow_template_id' => $template->id,
+            'step_order' => 1,
+            'name' => 'Transport Officer',
+            'approver_type' => 'office',
+            'approver_office_id' => $office->id,
+            'on_reject_action' => 'terminate',
+        ]);
+
+        $category = ApplicationCategory::create([
+            'name' => 'Transport Pass 2',
+            'form_schema' => [['key' => 'pickup_point', 'label' => 'Pickup point', 'type' => 'text', 'required' => true]],
+            'workflow_template_id' => $template->id,
+        ]);
+
+        $student = User::factory()->create(['role' => 'student', 'status' => 'active']);
+        $this->actingAs($student)->postJson('/api/applications', [
+            'application_category_id' => $category->id,
+            'form_data' => ['pickup_point' => 'Main Gate'],
+        ])->assertCreated();
+
+        $this->actingAs($user)
+            ->getJson('/api/dashboard/staff')
+            ->assertOk()
+            ->assertJsonPath('data.staff.employee_no', 'OFF-003')
+            ->assertJsonPath('data.staff.admin_department.name', 'Transport Department')
+            ->assertJsonPath('data.offices.0.name', 'Transport Officer')
+            ->assertJsonPath('data.pending_count', 1);
     }
 
     public function test_staff_cannot_access_any_attendance_module_route(): void
@@ -150,6 +213,7 @@ class StaffAccountTest extends TestCase
         $staffUser = User::factory()->create(['email' => 'nasir@example.com', 'role' => 'staff', 'status' => 'active']);
         \App\Models\Staff::create([
             'user_id' => $staffUser->id,
+            'admin_department_id' => AdminDepartment::where('name', 'Registrar Office')->firstOrFail()->id,
             'employee_no' => 'OFF-002',
             'designation' => 'Registrar',
         ]);

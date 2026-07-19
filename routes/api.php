@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\Admin\AdminDepartmentController;
 use App\Http\Controllers\Admin\BatchController;
 use App\Http\Controllers\Admin\DepartmentController;
 use App\Http\Controllers\Admin\ProgramController;
@@ -88,6 +89,15 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('departments', [DepartmentController::class, 'store']);
         Route::get('departments/{department}', [DepartmentController::class, 'show']);
         Route::put('departments/{department}', [DepartmentController::class, 'update']);
+
+        // Administrative departments (Examination Department, IT Department,
+        // Registrar Office, Transport Department, ...) - the non-teaching
+        // counterpart to the academic departments above. Not public, unlike
+        // departments/programs/batches, since it's purely admin-config data.
+        Route::get('admin-departments', [AdminDepartmentController::class, 'index']);
+        Route::post('admin-departments', [AdminDepartmentController::class, 'store']);
+        Route::get('admin-departments/{adminDepartment}', [AdminDepartmentController::class, 'show']);
+        Route::put('admin-departments/{adminDepartment}', [AdminDepartmentController::class, 'update']);
 
         Route::post('programs', [ProgramController::class, 'store']);
         Route::get('programs/{program}', [ProgramController::class, 'show']);

@@ -8,6 +8,7 @@ use App\Modules\ApplicationTracking\Http\Requests\WorkflowTemplate\StoreWorkflow
 use App\Modules\ApplicationTracking\Http\Requests\WorkflowTemplate\UpdateWorkflowTemplateRequest;
 use App\Modules\ApplicationTracking\Http\Resources\WorkflowTemplateResource;
 use App\Modules\ApplicationTracking\Models\Application;
+use App\Modules\ApplicationTracking\Models\Office;
 use App\Modules\ApplicationTracking\Models\WorkflowStep;
 use App\Modules\ApplicationTracking\Models\WorkflowTemplate;
 use Illuminate\Http\JsonResponse;
@@ -17,7 +18,7 @@ class WorkflowTemplateController extends Controller
 {
     public function index(): JsonResponse
     {
-        $templates = WorkflowTemplate::with('steps.office')->latest()->paginate(15);
+        $templates = WorkflowTemplate::with(['steps.office', 'steps.approverUser'])->latest()->paginate(15);
 
         return $this->paginated(WorkflowTemplateResource::collection($templates), $templates);
     }
@@ -35,12 +36,12 @@ class WorkflowTemplateController extends Controller
             return $template;
         });
 
-        return $this->ok(WorkflowTemplateResource::make($template->load('steps.office')), 'Workflow template created', 201);
+        return $this->ok(WorkflowTemplateResource::make($template->load(['steps.office', 'steps.approverUser'])), 'Workflow template created', 201);
     }
 
     public function show(WorkflowTemplate $workflowTemplate): JsonResponse
     {
-        return $this->ok(WorkflowTemplateResource::make($workflowTemplate->load('steps.office')));
+        return $this->ok(WorkflowTemplateResource::make($workflowTemplate->load(['steps.office', 'steps.approverUser'])));
     }
 
     public function update(UpdateWorkflowTemplateRequest $request, WorkflowTemplate $workflowTemplate): JsonResponse
@@ -57,7 +58,7 @@ class WorkflowTemplateController extends Controller
             }
         });
 
-        return $this->ok(WorkflowTemplateResource::make($workflowTemplate->load('steps.office')), 'Workflow template updated');
+        return $this->ok(WorkflowTemplateResource::make($workflowTemplate->load(['steps.office', 'steps.approverUser'])), 'Workflow template updated');
     }
 
     /**
@@ -73,12 +74,24 @@ class WorkflowTemplateController extends Controller
         $createdIds = [];
 
         foreach ($steps as $index => $stepData) {
+            $approverOfficeId = $stepData['approver_type'] === 'office' ? ($stepData['approver_office_id'] ?? null) : null;
+            $approverUserId = $stepData['approver_type'] === 'office' ? ($stepData['approver_user_id'] ?? null) : null;
+
+            if ($approverUserId && $approverOfficeId) {
+                $isMember = Office::whereKey($approverOfficeId)->whereHas('users', fn ($q) => $q->where('users.id', $approverUserId))->exists();
+
+                if (! $isMember) {
+                    throw new BusinessException("The chosen approver for step \"{$stepData['name']}\" is not a member of the selected office.");
+                }
+            }
+
             $step = WorkflowStep::create([
                 'workflow_template_id' => $template->id,
                 'step_order' => $index + 1,
                 'name' => $stepData['name'],
                 'approver_type' => $stepData['approver_type'],
-                'approver_office_id' => $stepData['approver_type'] === 'office' ? ($stepData['approver_office_id'] ?? null) : null,
+                'approver_office_id' => $approverOfficeId,
+                'approver_user_id' => $approverUserId,
                 'on_reject_action' => $stepData['on_reject_action'] ?? 'terminate',
                 'allow_forward' => $stepData['allow_forward'] ?? false,
             ]);

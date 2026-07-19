@@ -22,6 +22,7 @@ class UpdateWorkflowTemplateRequest extends FormRequest
             'steps.*.name' => ['required_with:steps', 'string', 'max:255'],
             'steps.*.approver_type' => ['required_with:steps', 'string', 'in:office,applicant_department_hod'],
             'steps.*.approver_office_id' => ['required_if:steps.*.approver_type,office', 'nullable', 'integer', 'exists:offices,id'],
+            'steps.*.approver_user_id' => ['nullable', 'integer', 'exists:users,id'],
             'steps.*.on_reject_action' => ['sometimes', 'string', 'in:terminate,return_to_applicant'],
             'steps.*.allow_forward' => ['sometimes', 'boolean'],
         ];

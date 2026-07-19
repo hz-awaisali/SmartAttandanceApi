@@ -16,7 +16,7 @@ class StaffController extends Controller
 
     public function index(): JsonResponse
     {
-        $staff = Staff::with(['user', 'department'])->latest()->paginate(15);
+        $staff = Staff::with(['user', 'adminDepartment'])->latest()->paginate(15);
 
         return $this->ok(StaffResource::collection($staff));
     }
@@ -25,18 +25,18 @@ class StaffController extends Controller
     {
         $staff = $this->staff->create($request->validated());
 
-        return $this->ok(StaffResource::make($staff->load(['user', 'department'])), 'Staff member created', 201);
+        return $this->ok(StaffResource::make($staff->load(['user', 'adminDepartment'])), 'Staff member created', 201);
     }
 
     public function show(Staff $staff): JsonResponse
     {
-        return $this->ok(StaffResource::make($staff->load(['user', 'department'])));
+        return $this->ok(StaffResource::make($staff->load(['user', 'adminDepartment'])));
     }
 
     public function update(UpdateStaffRequest $request, Staff $staff): JsonResponse
     {
         $staff = $this->staff->update($staff, $request->validated());
 
-        return $this->ok(StaffResource::make($staff->load(['user', 'department'])), 'Staff member updated');
+        return $this->ok(StaffResource::make($staff->load(['user', 'adminDepartment'])), 'Staff member updated');
     }
 }

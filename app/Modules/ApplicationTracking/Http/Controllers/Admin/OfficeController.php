@@ -13,35 +13,35 @@ class OfficeController extends Controller
 {
     public function index(): JsonResponse
     {
-        $offices = Office::with(['department', 'users'])->latest()->paginate(15);
+        $offices = Office::with(['adminDepartment', 'users'])->latest()->paginate(15);
 
         return $this->paginated(OfficeResource::collection($offices), $offices);
     }
 
     public function store(StoreOfficeRequest $request): JsonResponse
     {
-        $office = Office::create($request->safe()->only(['name', 'department_id']));
+        $office = Office::create($request->safe()->only(['name', 'admin_department_id']));
 
         if ($request->filled('user_ids')) {
             $office->users()->sync($request->input('user_ids'));
         }
 
-        return $this->ok(OfficeResource::make($office->load(['department', 'users'])), 'Office created', 201);
+        return $this->ok(OfficeResource::make($office->load(['adminDepartment', 'users'])), 'Office created', 201);
     }
 
     public function show(Office $office): JsonResponse
     {
-        return $this->ok(OfficeResource::make($office->load(['department', 'users'])));
+        return $this->ok(OfficeResource::make($office->load(['adminDepartment', 'users'])));
     }
 
     public function update(UpdateOfficeRequest $request, Office $office): JsonResponse
     {
-        $office->update($request->safe()->only(['name', 'department_id']));
+        $office->update($request->safe()->only(['name', 'admin_department_id']));
 
         if ($request->has('user_ids')) {
             $office->users()->sync($request->input('user_ids'));
         }
 
-        return $this->ok(OfficeResource::make($office->load(['department', 'users'])), 'Office updated');
+        return $this->ok(OfficeResource::make($office->load(['adminDepartment', 'users'])), 'Office updated');
     }
 }

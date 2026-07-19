@@ -17,7 +17,7 @@ class StoreStaffRequest extends FormRequest
             'name' => ['required', 'string', 'max:255'],
             'email' => ['required', 'email', 'max:255', 'unique:users,email'],
             'password' => ['required', 'string', 'min:8', 'confirmed'],
-            'department_id' => ['nullable', 'integer', 'exists:departments,id'],
+            'admin_department_id' => ['required', 'integer', 'exists:admin_departments,id'],
             'employee_no' => ['required', 'string', 'max:50', 'unique:staff,employee_no'],
             'designation' => ['required', 'string', 'max:100'],
             'phone' => ['nullable', 'string', 'max:20'],

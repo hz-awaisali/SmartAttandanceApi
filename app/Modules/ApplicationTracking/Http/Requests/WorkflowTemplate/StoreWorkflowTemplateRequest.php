@@ -26,6 +26,11 @@ class StoreWorkflowTemplateRequest extends FormRequest
             'steps.*.name' => ['required', 'string', 'max:255'],
             'steps.*.approver_type' => ['required', 'string', 'in:office,applicant_department_hod'],
             'steps.*.approver_office_id' => ['required_if:steps.*.approver_type,office', 'nullable', 'integer', 'exists:offices,id'],
+            // Optional: narrows an office-type step to one specific member
+            // of that office instead of broadcasting to every holder.
+            // Membership is validated in the controller (needs the office
+            // context, not expressible as a plain rule here).
+            'steps.*.approver_user_id' => ['nullable', 'integer', 'exists:users,id'],
             'steps.*.on_reject_action' => ['sometimes', 'string', 'in:terminate,return_to_applicant'],
             'steps.*.allow_forward' => ['sometimes', 'boolean'],
         ];

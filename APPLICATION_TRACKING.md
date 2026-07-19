@@ -47,9 +47,10 @@ anywhere; it just calls `POST /applications` and follows whatever
 
 | Term | Meaning |
 |---|---|
-| **Office** | A named official position (e.g. "Examination Officer"). Admin-created, admin-assigns users to it. Completely separate from a user's `role` (admin/hod/teacher/student) — an Office is *who currently holds a desk*, not what kind of account they have. |
+| **AdminDepartment** | The administrative counterpart to an academic Department (Examination Department, IT Department, Registrar Office, Transport Department, ...). Every `Office` belongs to one. Fully separate table/ID space from academic `Department` — see [STAFF_ACCOUNTS.md](STAFF_ACCOUNTS.md). |
+| **Office** | A named official position (e.g. "Examination Officer"), belonging to an **AdminDepartment**. Admin-created, admin-assigns users to it. Completely separate from a user's `role` (admin/hod/teacher/student) — an Office is *who currently holds a desk*, not what kind of account they have. |
 | **WorkflowTemplate** | A named, ordered chain of **steps**. |
-| **WorkflowStep** | One stop in the chain. Its approver is either a specific **Office**, or the special value `applicant_department_hod` (resolved automatically — whoever is HOD of the *applicant's own* department, no office needed). Approving a step moves to the next one, or — if there is no next step — finalizes the application. |
+| **WorkflowStep** | One stop in the chain. Its approver is either a specific **Office** (optionally narrowed to *one specific member* of that office — see §6.9), or the special value `applicant_department_hod` (resolved automatically — whoever is HOD of the *applicant's own* academic department, no office needed). Approving a step moves to the next one, or — if there is no next step — finalizes the application. |
 | **ApplicationCategory** | An application "type" a user can pick from: a name, a dynamic `form_schema` (see §5), a linked `WorkflowTemplate`, and optionally a restriction on who may submit it (`applicant_roles`). |
 | **Application** | One submitted instance: locked form answers, a current step, a status. |
 | **ApplicationAction** | One timeline entry — submit / approve / reject / forward / comment / resubmit / cancel. This *is* the "tracking" — render it as a vertical timeline in the detail screen. |
@@ -360,14 +361,19 @@ and only by the applicant. Sets `status: "cancelled"`, permanent.
 
 ```
 GET  /offices
-POST /offices          { "name": "Transport Officer", "department_id": null, "user_ids": [12, 15] }
+POST /offices          { "name": "Transport Officer", "admin_department_id": 4, "user_ids": [12, 15] }
 GET  /offices/{id}
-PUT  /offices/{id}     { "name"?, "department_id"?, "user_ids"? }
+PUT  /offices/{id}     { "name"?, "admin_department_id"?, "user_ids"? }
 ```
-Admin-only. `department_id: null` = university-wide office; set it for a
-department-scoped one. `user_ids` **replaces** the full set of holders
-(it's a sync, not an add) — send the complete list every time, including
-existing holders you want to keep.
+Admin-only. `admin_department_id` is **required** — every Office belongs to
+an *administrative* department (Examination Department, IT Department,
+Registrar Office, Transport Department, ...), a completely separate table
+from the academic `departments` used by Teacher/Student — see
+[STAFF_ACCOUNTS.md §1](STAFF_ACCOUNTS.md#1-the-problem-this-solves--two-kinds-of-departments)
+for the full picture, and `GET /admin-departments` to list valid ids.
+`user_ids` **replaces** the full set of holders (it's a sync, not an add) —
+send the complete list every time, including existing holders you want to
+keep.
 
 ### 6.9 Admin — Workflow templates
 
@@ -378,7 +384,7 @@ POST /workflow-templates
   "name": "Transcript Request Workflow",
   "steps": [
     { "name": "Applicant Department HOD", "approver_type": "applicant_department_hod", "on_reject_action": "return_to_applicant" },
-    { "name": "Examination Officer", "approver_type": "office", "approver_office_id": 1, "on_reject_action": "terminate", "allow_forward": true }
+    { "name": "Examination Officer", "approver_type": "office", "approver_office_id": 1, "approver_user_id": null, "on_reject_action": "terminate", "allow_forward": true }
   ]
 }
 GET  /workflow-templates/{id}
@@ -392,6 +398,34 @@ never send `on_approve_next_step_id` yourself. `approver_type` is either
 Updating `steps` on a template that has any non-terminal (`pending`/
 `returned_for_revision`) applications still referencing it is blocked with
 a `409` — finish or cancel those first, or create a new template instead.
+
+#### Specific officer targeting
+
+An `office`-type step can optionally set `approver_user_id` to narrow it
+down from "any current holder of this Office" to **one specific person**.
+Use this when broadcasting to every office member isn't wanted (e.g. a
+routing rule like "result verification always goes to this one specific
+Controller, not the whole Examination Officer desk").
+
+- The chosen `approver_user_id` **must be a current member of
+  `approver_office_id`** — the server validates this and returns `422` with
+  `"The chosen approver for step "X" is not a member of the selected
+  office."` if not. Office stays the organizational anchor; this field only
+  ever narrows it, never replaces it.
+- When set: only that person sees the application in
+  `GET /applications?assigned=1`, only they can `act` on it (everyone else
+  who holds the same Office gets `403`), and notifications only go to them
+  — not the whole office.
+- When left `null` (the default, and everything built before this): behaves
+  exactly as before — every office holder is notified, sees it in their
+  queue, and can act (whoever acts first resolves it).
+- `WorkflowStepResource` reflects this back as `approver_user_id` +
+  `approver_user` (`{id, name, email}`) alongside the existing `office`
+  field, so an admin-side workflow builder can show "→ targets: Amina
+  Controller" instead of just "→ Examination Officer desk."
+- This is **workflow-design-time** targeting only. The separate ad-hoc
+  `forward` action (§6.5) always still broadcasts to the whole destination
+  office — narrowing wasn't extended there.
 
 ### 6.10 Admin — Application categories
 
@@ -486,9 +520,12 @@ Mirror the same pattern for `ApplicationCategoryModel` (incl. a
 forwardedToOfficeId, formDataSnapshot, attachments, createdAt`),
 `ApplicationAttachmentModel` (`id, fieldKey, url, originalName, mimeType,
 uploadedByUserId, createdAt` — `url` is already a fully resolved link,
-same `mediaBaseUrl` handling as avatars applies if needed), `OfficeModel`,
-`WorkflowTemplateModel`, `WorkflowStepModel` (only needed for the admin
-side, if the admin panel is built in this app too).
+same `mediaBaseUrl` handling as avatars applies if needed), `OfficeModel`
+(`id, name, adminDepartmentId, adminDepartmentName, users: [{id,name,email}]`),
+`WorkflowTemplateModel`, `WorkflowStepModel` (add `approverUserId` +
+`approverUser: {id,name,email}?` alongside the existing office fields —
+only needed for the admin side, if the admin panel is built in this app
+too).
 
 Add the new endpoint paths to `lib/core/constants/api_constants.dart`
 alongside the existing ones, and a `PagedResult<T>` wrapper (`items`,
