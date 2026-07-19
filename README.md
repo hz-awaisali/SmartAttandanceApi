@@ -28,6 +28,7 @@ and admins; this repo is purely the JSON API both talk to.
 - [Testing](#testing)
 - [Module 1 — Smart Attendance](#module-1--smart-attendance)
 - [Module 2 — Digital Application Tracking](#module-2--digital-application-tracking)
+- [Non-teaching office holders — the `staff` role](#non-teaching-office-holders--the-staff-role)
 - [Domain model](#domain-model)
 - [API surface](#api-surface)
 - [Project structure](#project-structure)
@@ -200,11 +201,14 @@ Feature tests use `RefreshDatabase`, so the schema (both the core migrations
 always registered) is rebuilt automatically — no manual seeding needed for
 tests, each one creates its own fixtures.
 
-Coverage today: `AttendanceReportTest`, `PasswordResetTest`, and
+Coverage today: `AttendanceReportTest`, `PasswordResetTest`,
 `ApplicationTrackingTest` (submit → approve → advance → approve; reject →
 resubmit → re-enters the same step; direct-to-officer with no HOD step;
 403 for the wrong office; duplicate-active-application blocked; cancel;
-unstaffed-office guard).
+unstaffed-office guard), and `StaffAccountTest` (admin creates a staff
+account; a staff account holds an Office and acts on an assigned
+application; every attendance-module route 403s for staff; `GET /sessions`
+returns empty for staff; staff password reset via `employee_no`).
 
 ---
 
@@ -384,6 +388,37 @@ on a template that still has non-terminal applications referencing it.
 
 ---
 
+## Non-teaching office holders — the `staff` role
+
+An `Office` (Examination Officer, Transport Officer, ...) can be held by
+any `User` — that was always decoupled from `role`, so a teacher who also
+holds an office got both modules automatically, no special-casing needed.
+What was missing was a way to create an account for an office holder who
+**isn't** a teacher at all (a Registrar, an IT Officer). The fix is a
+fifth, coarse `role` value: **`staff`** — a plain account with **zero
+attendance-module access**, only Application Tracking.
+
+- **Admin-only CRUD**: `GET/POST /staff`, `GET/PUT /staff/{id}` — same
+  shape as the `Teacher` admin endpoints, minus the HOD-scoped index
+  (staff are university-wide, not department-bound).
+- **New `staff` table**: mirrors `Teacher` (`employee_no`, `designation`,
+  `phone`, nullable `department_id`) — needed so password reset can verify
+  staff the same `email + employee_no` way it already verifies teachers.
+- **Attendance exclusion is enforced, not just assumed**: `staff` simply
+  never appears in any existing `role:` middleware allowlist, so every
+  attendance-module route already 403s it by construction. The one route
+  that needed an explicit fix was `GET /sessions` — it has no `role:`
+  middleware at all (any authenticated user can call it) and used to
+  silently fall through to "show everything" for any role it didn't
+  recognize; it now explicitly shows nothing unless the caller is
+  `teacher`/`student`/`hod`/`admin`.
+- **Full detail and a Flutter implementation guide**: see
+  [STAFF_ACCOUNTS.md](STAFF_ACCOUNTS.md), including the role↔module access
+  matrix and why a "teacher who also holds an office" is a different case
+  from a `staff` account.
+
+---
+
 ## Domain model
 
 **Core attendance system:**
@@ -400,10 +435,17 @@ Timetable (Batch + ProgramCourse + Teacher + Room + Day + TimeSlot)
               └──< SuspiciousAttempt   (rejected submissions, audit trail)
 ```
 
-- **User** — `role` enum (`admin`/`hod`/`teacher`/`student`), Sanctum
-  `HasApiTokens`. This enum is intentionally **never extended** — see below.
+- **User** — `role` enum (`admin`/`hod`/`teacher`/`student`/`staff`),
+  Sanctum `HasApiTokens`. Widened once, deliberately, for `staff` (see
+  [above](#non-teaching-office-holders--the-staff-role)) — a coarse
+  access-tier addition, not a place to add specific job titles (those stay
+  data, via `Office`).
 - **Teacher** — `is_hod` is *computed* (true iff `Department.hod_teacher_id`
   points at this teacher), never a stored flag.
+- **Staff** — non-teaching office holders (Examination Officer, Registrar,
+  ...). Same shape as `Teacher` minus any teaching-specific concept;
+  `department_id` is nullable and typically unset (these are usually
+  university-wide positions).
 - **Room** — `beacon_major` + `beacon_uuid` (the iBeacon identity) +
   `rssi_threshold`.
 - **Notification** — a simple directly-queryable table (not Laravel's
@@ -464,7 +506,7 @@ are 422 with an `errors` map; domain-rule failures use
 | Teacher + HOD | `POST sessions/{timetable}/start`, `POST sessions/{session}/end`, `GET sessions/{session}/attendance`, `GET teacher/schedule` |
 | Reporting | `GET attendance/report` (scope depends on role: teacher → own classes, HOD → own department, admin → global) |
 | Admin + HOD (read) | `GET teachers`, `GET students`, `GET timetables` |
-| Admin CRUD | `departments`, `programs`, `program-courses`, `batches`, `rooms`, `time-slots`, `teachers`, `students`, `timetables`, `GET dashboard/admin` |
+| Admin CRUD | `departments`, `programs`, `program-courses`, `batches`, `rooms`, `time-slots`, `teachers`, `students`, `timetables`, `staff`, `GET dashboard/admin` |
 | HOD | `GET dashboard/hod` |
 | Profile (any role) | `GET/PUT profile`, `PUT profile/password`, `POST/DELETE profile/avatar`, `DELETE profile` |
 | Shared | `GET sessions`, `GET sessions/{session}`, `GET notifications`, `PUT notifications/{id}/read`, `DELETE notifications/{id}` |
@@ -508,7 +550,7 @@ routes/
 ├── api.php                        core attendance system (module routes are NOT here — see above)
 └── web.php                        health check only
 
-tests/Feature/                     AttendanceReportTest, PasswordResetTest, ApplicationTrackingTest
+tests/Feature/                     AttendanceReportTest, PasswordResetTest, ApplicationTrackingTest, StaffAccountTest
 ```
 
 ---
@@ -527,6 +569,12 @@ too.
 
 ## Further reading
 
+- **`STAFF_ACCOUNTS.md`** — the `staff` role in full detail: the
+  role↔module access matrix, every new endpoint, and a Flutter
+  implementation guide.
+- **`APPLICATION_TRACKING.md`** — the Digital Application Tracking
+  module's full API reference and a Flutter implementation guide (concepts,
+  every endpoint, dynamic form rendering, suggested Dart models/screens).
 - **`PROJECT_CONTEXT.md`** — a living, detailed reference on the core
   attendance system's domain model, design history, and known gaps.
 - **`project_handoff.md`** — the full hardware/firmware story (ESP32 beacon
